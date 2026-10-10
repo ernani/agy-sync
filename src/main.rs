@@ -5,7 +5,7 @@ use agy_sync::harnesses::{discover_harnesses, HarnessKind};
 use agy_sync::interactive::run_interactive_wizard;
 use agy_sync::transport::RemoteEndpoint;
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 #[command(
     name = "agy-sync",
     version,
-    about = "Intelligent multi-harness project & session synchronization engine for the Agy ecosystem (~/.gemini)"
+    about = "Intelligent multi-harness project & session synchronization engine for the Agy ecosystem (~/.gemini)",
+    arg_required_else_help = true
 )]
 struct Cli {
     /// Launch interactive step-by-step synchronization wizard (en-US)
@@ -113,7 +114,7 @@ fn resolve_remote_endpoint(
 ) -> Result<RemoteEndpoint> {
     let saved = AgySyncConfig::load(home_dir).unwrap_or_default();
     let raw = cli_remote
-        .or_else(|| env::var("GEMINI_SYNC_REMOTE").ok().filter(|s| !s.is_empty()))
+        .or_else(|| env::var("AGY_SYNC_REMOTE").ok().filter(|s| !s.is_empty()))
         .or(saved.default_host)
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -186,6 +187,13 @@ fn resolve_harnesses(
 }
 
 fn main() -> Result<()> {
+    if env::args_os().len() <= 1 {
+        let mut cmd = Cli::command();
+        cmd.print_help()?;
+        println!();
+        return Ok(());
+    }
+
     let cli = Cli::parse();
 
     let local_home = env::var("HOME").context("HOME environment variable is not set")?;
@@ -303,4 +311,18 @@ fn main() -> Result<()> {
     print_report(&report, &base_config);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_no_args_renders_help_menu() {
+        let mut cmd = Cli::command();
+        let help = cmd.render_help().to_string();
+        assert!(help.contains("Usage: agy-sync"));
+        assert!(help.contains("Commands:"));
+        assert!(help.contains("Options:"));
+    }
 }
