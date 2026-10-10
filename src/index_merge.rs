@@ -7,14 +7,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-/// Full row from `conversation_summaries` in `conversation_summaries.db`.
+/// Row from `conversation_summaries` in `conversation_summaries.db`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummaryRow {
     pub conversation_id: String,
     pub title: String,
     pub preview: String,
     pub step_count: i64,
-    pub created_time: String,
     pub last_modified_time: String,
     pub workspace_uris: String,
     pub status: String,
@@ -25,13 +24,24 @@ pub struct SummaryRow {
     pub raw_summary: Vec<u8>,
 }
 
-/// FTS chunk row from `conversation_search_chunks` / `conversation_search_fts`.
+/// FTS chunk row from `conversations_fts` in `conversation_summaries.db`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchChunkRow {
+pub struct FtsChunkRow {
     pub conversation_id: String,
-    pub chunk_type: String,
-    pub step_index: i64,
-    pub content_text: String,
+    pub chunk_index: String,
+    pub chunk_first_step: String,
+    pub chunk_last_step: String,
+    pub last_modified_time: String,
+    pub step_count: String,
+    pub last_step_created_at: String,
+    pub archived: String,
+    pub user_step_byte_offsets: String,
+    pub agent_step_byte_offsets: String,
+    pub title: String,
+    pub workspace: String,
+    pub project: String,
+    pub user_body: String,
+    pub agent_body: String,
 }
 
 /// Portable manifest containing all global SQLite and Protobuf index entries for a specific set
@@ -39,7 +49,7 @@ pub struct SearchChunkRow {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectIndexManifest {
     pub summaries: Vec<SummaryRow>,
-    pub search_chunks: Vec<SearchChunkRow>,
+    pub fts_chunks: Vec<FtsChunkRow>,
     /// Raw `TrajectorySummary` protobuf entries keyed by `conversation_id` for `*_summaries_proto.pb`
     pub protobuf_entries: BTreeMap<String, Vec<u8>>,
     /// Filenames of `*_summaries_proto.pb` present in the source harness directory
@@ -55,58 +65,68 @@ pub struct MergeStats {
     pub protobuf_entries_updated: usize,
 }
 
-/// Ensures the schema of `conversation_summaries.db` exists on the given SQLite connection.
+/// Ensures the production schema of `conversation_summaries.db` exists on the given SQLite connection.
 pub fn ensure_summary_db_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS metadata (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
+        "CREATE TABLE IF NOT EXISTS `conversation_summaries` (
+            `conversation_id` text,
+            `title` text NOT NULL DEFAULT '',
+            `preview` text NOT NULL DEFAULT '',
+            `step_count` integer NOT NULL DEFAULT 0,
+            `last_modified_time` datetime NOT NULL DEFAULT '',
+            `workspace_uris` text NOT NULL DEFAULT '',
+            `status` text NOT NULL DEFAULT '',
+            `source` text NOT NULL DEFAULT '',
+            `project_id` text NOT NULL DEFAULT '',
+            `agent_name` text NOT NULL DEFAULT '',
+            `parent_conversation_id` text NOT NULL DEFAULT '',
+            `nesting_depth` integer NOT NULL DEFAULT 0,
+            `battle_id` text NOT NULL DEFAULT '',
+            `winning_conversation_id` text NOT NULL DEFAULT '',
+            `not_fully_idle` numeric NOT NULL DEFAULT false,
+            `killed` numeric NOT NULL DEFAULT false,
+            `last_user_input_time` datetime NOT NULL DEFAULT '',
+            `last_user_input_step_index` integer NOT NULL DEFAULT -1,
+            `app_data_dir` text NOT NULL DEFAULT '',
+            `raw_summary` blob,
+            `group_id` text NOT NULL DEFAULT '',
+            PRIMARY KEY (`conversation_id`)
         );
-        CREATE TABLE IF NOT EXISTS conversation_summaries (
-            conversation_id TEXT PRIMARY KEY,
-            title TEXT NOT NULL DEFAULT '',
-            preview TEXT NOT NULL DEFAULT '',
-            step_count INTEGER NOT NULL DEFAULT 0,
-            created_time TEXT NOT NULL DEFAULT '',
-            last_modified_time TEXT NOT NULL DEFAULT '',
-            workspace_uris TEXT NOT NULL DEFAULT '',
-            status TEXT NOT NULL DEFAULT '',
-            agent_name TEXT NOT NULL DEFAULT '',
-            parent_conversation_id TEXT NOT NULL DEFAULT '',
-            project_id TEXT NOT NULL DEFAULT '',
-            last_user_input_time TEXT NOT NULL DEFAULT '',
-            raw_summary BLOB
-        );
-        CREATE INDEX IF NOT EXISTS idx_summaries_modified ON conversation_summaries(last_modified_time DESC);
-        CREATE INDEX IF NOT EXISTS idx_summaries_parent ON conversation_summaries(parent_conversation_id);
-        CREATE INDEX IF NOT EXISTS idx_summaries_project ON conversation_summaries(project_id);
-        CREATE TABLE IF NOT EXISTS conversation_search_chunks (
-            chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id TEXT NOT NULL,
-            chunk_type TEXT NOT NULL,
-            step_index INTEGER NOT NULL DEFAULT -1,
-            content_text TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_search_chunks_conv ON conversation_search_chunks(conversation_id);
-        CREATE VIRTUAL TABLE IF NOT EXISTS conversation_search_fts USING fts5(
-            content_text,
-            content='conversation_search_chunks',
-            content_rowid='chunk_id',
-            tokenize='unicode61'
-        );
-        CREATE TRIGGER IF NOT EXISTS conversation_search_chunks_ai AFTER INSERT ON conversation_search_chunks BEGIN
-            INSERT INTO conversation_search_fts(rowid, content_text) VALUES (new.chunk_id, new.content_text);
-        END;
-        CREATE TRIGGER IF NOT EXISTS conversation_search_chunks_ad AFTER DELETE ON conversation_search_chunks BEGIN
-            INSERT INTO conversation_search_fts(conversation_search_fts, rowid, content_text) VALUES('delete', old.chunk_id, old.content_text);
-        END;
-        CREATE TRIGGER IF NOT EXISTS conversation_search_chunks_au AFTER UPDATE ON conversation_search_chunks BEGIN
-            INSERT INTO conversation_search_fts(conversation_search_fts, rowid, content_text) VALUES('delete', old.chunk_id, old.content_text);
-            INSERT INTO conversation_search_fts(rowid, content_text) VALUES (new.chunk_id, new.content_text);
-        END;",
+        CREATE INDEX IF NOT EXISTS `idx_conversation_summaries_last_user_input_time` ON `conversation_summaries`(`last_user_input_time`);
+        CREATE INDEX IF NOT EXISTS `idx_conversation_summaries_last_modified_time` ON `conversation_summaries`(`last_modified_time`);
+        CREATE TABLE IF NOT EXISTS search_schema_version (version INTEGER PRIMARY KEY);
+        CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(
+            conversation_id UNINDEXED,
+            chunk_index UNINDEXED,
+            chunk_first_step UNINDEXED,
+            chunk_last_step UNINDEXED,
+            last_modified_time UNINDEXED,
+            step_count UNINDEXED,
+            last_step_created_at UNINDEXED,
+            archived UNINDEXED,
+            user_step_byte_offsets UNINDEXED,
+            agent_step_byte_offsets UNINDEXED,
+            title,
+            workspace,
+            project,
+            user_body,
+            agent_body,
+            tokenize = 'unicode61 remove_diacritics 2',
+            prefix = '1 2 3'
+        );",
     )
     .context("Failed to initialize conversation_summaries.db schema")?;
     Ok(())
+}
+
+fn col_to_str(row: &rusqlite::Row<'_>, idx: usize) -> String {
+    if let Ok(s) = row.get::<_, String>(idx) {
+        return s;
+    }
+    if let Ok(i) = row.get::<_, i64>(idx) {
+        return i.to_string();
+    }
+    String::new()
 }
 
 /// Exports the SQLite summary rows, FTS search chunks, and `*_summaries_proto.pb` entries
@@ -128,16 +148,16 @@ pub fn export_project_manifest(
         let _ = conn.busy_timeout(std::time::Duration::from_millis(3000));
 
         let mut sum_stmt = conn.prepare(
-            "SELECT conversation_id, title, preview, step_count, created_time, last_modified_time,
+            "SELECT conversation_id, title, preview, step_count, last_modified_time,
                     workspace_uris, status, agent_name, parent_conversation_id, project_id,
                     last_user_input_time, raw_summary
              FROM conversation_summaries
              WHERE conversation_id = ?1",
         )?;
 
-        let has_chunks_table: bool = conn
+        let has_fts_table: bool = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='conversation_search_chunks'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='conversations_fts'",
                 [],
                 |r| r.get::<_, i64>(0),
             )
@@ -152,15 +172,14 @@ pub fn export_project_manifest(
                         title: row.get(1)?,
                         preview: row.get(2)?,
                         step_count: row.get(3)?,
-                        created_time: row.get(4)?,
-                        last_modified_time: row.get(5)?,
-                        workspace_uris: row.get(6)?,
-                        status: row.get(7)?,
-                        agent_name: row.get(8)?,
-                        parent_conversation_id: row.get(9)?,
-                        project_id: row.get(10)?,
-                        last_user_input_time: row.get(11)?,
-                        raw_summary: row.get::<_, Option<Vec<u8>>>(12)?.unwrap_or_default(),
+                        last_modified_time: row.get(4)?,
+                        workspace_uris: row.get(5)?,
+                        status: row.get(6)?,
+                        agent_name: row.get(7)?,
+                        parent_conversation_id: row.get(8)?,
+                        project_id: row.get(9)?,
+                        last_user_input_time: row.get(10)?,
+                        raw_summary: row.get::<_, Option<Vec<u8>>>(11)?.unwrap_or_default(),
                     })
                 })
                 .optional()?;
@@ -182,30 +201,47 @@ pub fn export_project_manifest(
                 manifest.summaries.push(s_row);
             }
 
-            if has_chunks_table {
-                let mut chunk_stmt = conn.prepare(
-                    "SELECT conversation_id, chunk_type, step_index, content_text
-                     FROM conversation_search_chunks
-                     WHERE conversation_id = ?1
-                     ORDER BY chunk_id ASC",
-                )?;
-                let chunks = chunk_stmt.query_map(params![cid], |row| {
-                    Ok(SearchChunkRow {
-                        conversation_id: row.get(0)?,
-                        chunk_type: row.get(1)?,
-                        step_index: row.get(2)?,
-                        content_text: row.get(3)?,
-                    })
-                })?;
-                for c in chunks.flatten() {
-                    let mut c_row = c;
-                    if let Some((from_h, to_h)) = remap_homes {
-                        if !from_h.is_empty() && from_h != to_h {
-                            c_row.content_text = c_row.content_text.replace(from_h, to_h);
+            if has_fts_table {
+                if let Ok(mut fts_stmt) = conn.prepare(
+                    "SELECT conversation_id, chunk_index, chunk_first_step, chunk_last_step,
+                            last_modified_time, step_count, last_step_created_at, archived,
+                            user_step_byte_offsets, agent_step_byte_offsets, title, workspace,
+                            project, user_body, agent_body
+                     FROM conversations_fts
+                     WHERE conversation_id = ?1",
+                ) {
+                    if let Ok(chunks) = fts_stmt.query_map(params![cid], |row| {
+                        Ok(FtsChunkRow {
+                            conversation_id: col_to_str(row, 0),
+                            chunk_index: col_to_str(row, 1),
+                            chunk_first_step: col_to_str(row, 2),
+                            chunk_last_step: col_to_str(row, 3),
+                            last_modified_time: col_to_str(row, 4),
+                            step_count: col_to_str(row, 5),
+                            last_step_created_at: col_to_str(row, 6),
+                            archived: col_to_str(row, 7),
+                            user_step_byte_offsets: col_to_str(row, 8),
+                            agent_step_byte_offsets: col_to_str(row, 9),
+                            title: col_to_str(row, 10),
+                            workspace: col_to_str(row, 11),
+                            project: col_to_str(row, 12),
+                            user_body: col_to_str(row, 13),
+                            agent_body: col_to_str(row, 14),
+                        })
+                    }) {
+                        for c in chunks.flatten() {
+                            let mut c_row = c;
+                            if let Some((from_h, to_h)) = remap_homes {
+                                if !from_h.is_empty() && from_h != to_h {
+                                    c_row.workspace = c_row.workspace.replace(from_h, to_h);
+                                    c_row.user_body = c_row.user_body.replace(from_h, to_h);
+                                    c_row.agent_body = c_row.agent_body.replace(from_h, to_h);
+                                }
+                            }
+                            manifest.fts_chunks.push(c_row);
                         }
-                    }
-                    manifest.search_chunks.push(c_row);
-                }
+                    };
+                };
             }
         }
     }
@@ -294,9 +330,8 @@ pub fn merge_project_manifest(
     {
         let tx = conn.transaction()?;
 
-        // Group incoming search chunks by conversation_id
-        let mut chunks_by_cid: BTreeMap<&str, Vec<&SearchChunkRow>> = BTreeMap::new();
-        for c in &manifest.search_chunks {
+        let mut chunks_by_cid: BTreeMap<&str, Vec<&FtsChunkRow>> = BTreeMap::new();
+        for c in &manifest.fts_chunks {
             chunks_by_cid
                 .entry(c.conversation_id.as_str())
                 .or_default()
@@ -328,15 +363,14 @@ pub fn merge_project_manifest(
 
             tx.execute(
                 "INSERT INTO conversation_summaries (
-                    conversation_id, title, preview, step_count, created_time, last_modified_time,
+                    conversation_id, title, preview, step_count, last_modified_time,
                     workspace_uris, status, agent_name, parent_conversation_id, project_id,
                     last_user_input_time, raw_summary
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                 ON CONFLICT(conversation_id) DO UPDATE SET
                     title = excluded.title,
                     preview = excluded.preview,
                     step_count = excluded.step_count,
-                    created_time = excluded.created_time,
                     last_modified_time = excluded.last_modified_time,
                     workspace_uris = excluded.workspace_uris,
                     status = excluded.status,
@@ -350,7 +384,6 @@ pub fn merge_project_manifest(
                     &s.title,
                     &s.preview,
                     s.step_count,
-                    &s.created_time,
                     &s.last_modified_time,
                     &s.workspace_uris,
                     &s.status,
@@ -366,22 +399,42 @@ pub fn merge_project_manifest(
             updated_cids.insert(s.conversation_id.clone());
 
             if let Some(inc_chunks) = chunks_by_cid.get(s.conversation_id.as_str()) {
-                tx.execute(
-                    "DELETE FROM conversation_search_chunks WHERE conversation_id = ?1",
+                let _ = tx.execute(
+                    "DELETE FROM conversations_fts WHERE conversation_id = ?1",
                     params![&s.conversation_id],
-                )?;
-                let mut ins_chunk = tx.prepare(
-                    "INSERT INTO conversation_search_chunks (conversation_id, chunk_type, step_index, content_text)
-                     VALUES (?1, ?2, ?3, ?4)",
-                )?;
-                for c in inc_chunks {
-                    ins_chunk.execute(params![
-                        &c.conversation_id,
-                        &c.chunk_type,
-                        c.step_index,
-                        &c.content_text
-                    ])?;
-                    stats.fts_chunks_updated += 1;
+                );
+                if let Ok(mut ins_chunk) = tx.prepare(
+                    "INSERT INTO conversations_fts (
+                        conversation_id, chunk_index, chunk_first_step, chunk_last_step,
+                        last_modified_time, step_count, last_step_created_at, archived,
+                        user_step_byte_offsets, agent_step_byte_offsets, title, workspace,
+                        project, user_body, agent_body
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                ) {
+                    for c in inc_chunks {
+                        if ins_chunk
+                            .execute(params![
+                                &c.conversation_id,
+                                &c.chunk_index,
+                                &c.chunk_first_step,
+                                &c.chunk_last_step,
+                                &c.last_modified_time,
+                                &c.step_count,
+                                &c.last_step_created_at,
+                                &c.archived,
+                                &c.user_step_byte_offsets,
+                                &c.agent_step_byte_offsets,
+                                &c.title,
+                                &c.workspace,
+                                &c.project,
+                                &c.user_body,
+                                &c.agent_body,
+                            ])
+                            .is_ok()
+                        {
+                            stats.fts_chunks_updated += 1;
+                        }
+                    }
                 }
             }
         }
@@ -438,13 +491,11 @@ pub fn remap_conversation_artifacts(
     }
 
     for cid in conversation_ids {
-        // 1. Remap conversations/<id>.db
         let conv_db_path = harness_dir.join("conversations").join(format!("{}.db", cid));
         if conv_db_path.exists() {
             remap_single_conversation_db(&conv_db_path, from_h, to_h, deep_remap)?;
         }
 
-        // 2. Remap implicit/<id>.pb
         let implicit_path = harness_dir.join("implicit").join(format!("{}.pb", cid));
         if implicit_path.exists() {
             if let Ok(bytes) = fs::read(&implicit_path) {
@@ -456,7 +507,6 @@ pub fn remap_conversation_artifacts(
             }
         }
 
-        // 3. Optional deep remap for transcript.jsonl / transcript_full.jsonl
         if deep_remap {
             let logs_dir = harness_dir
                 .join("brain")
@@ -590,8 +640,12 @@ mod tests {
             params![cid_proj, &raw_mac],
         )?;
         src_conn.execute(
-            "INSERT INTO conversation_search_chunks (conversation_id, chunk_type, step_index, content_text)
-             VALUES (?1, 'step', 1, 'Edited /Users/devuser/proj/main.rs')",
+            "INSERT INTO conversations_fts (
+                conversation_id, chunk_index, chunk_first_step, chunk_last_step,
+                last_modified_time, step_count, last_step_created_at, archived,
+                user_step_byte_offsets, agent_step_byte_offsets, title, workspace,
+                project, user_body, agent_body
+             ) VALUES (?1, '0', '0', '25', '1760000000', '25', '1760000000', '0', '[]', '[]', 'My Project', '/Users/devuser/proj', '', 'Edited /Users/devuser/proj/main.rs', '')",
             params![cid_proj],
         )?;
         drop(src_conn);
@@ -658,7 +712,7 @@ mod tests {
 
         // Verify FTS search works on the remapped path!
         let fts_matches: i64 = verify_conn.query_row(
-            "SELECT COUNT(*) FROM conversation_search_fts WHERE conversation_search_fts MATCH 'remote'",
+            "SELECT COUNT(*) FROM conversations_fts WHERE conversations_fts MATCH 'remote'",
             [],
             |r| r.get(0),
         )?;
