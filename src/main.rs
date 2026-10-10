@@ -280,6 +280,15 @@ fn main() -> Result<()> {
         return run_interactive_wizard(base_config, cli.remote);
     }
 
+    if mode != SyncMode::Inspect {
+        use std::io::Write;
+        println!(
+            "==> [agy-sync] Scanning local harnesses for workspace: {}",
+            project_path.display()
+        );
+        let _ = std::io::stdout().flush();
+    }
+
     let local_gemini_root = base_config.local_gemini_root();
     base_config.selected_harnesses =
         resolve_harnesses(&cli.harness, &project_path, &local_gemini_root)?;

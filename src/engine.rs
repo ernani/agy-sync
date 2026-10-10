@@ -14,8 +14,19 @@ use crate::transport::{
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+fn log_progress(msg: &str) {
+    println!("==> {}", msg);
+    let _ = io::stdout().flush();
+}
+
+fn log_substep(msg: &str) {
+    println!("  • {}", msg);
+    let _ = io::stdout().flush();
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
@@ -451,6 +462,13 @@ fn run_session_harness(
 ) -> Result<HarnessSyncReport> {
     let subdir = kind.session_subdir().unwrap_or("antigravity");
     let local_harness_dir = config.local_dir_for_harness(kind);
+    if config.mode != SyncMode::Inspect {
+        log_progress(&format!(
+            "[2/4] Discovering & comparing sessions in harness '{}' ({}) ...",
+            kind.cli_id(),
+            kind.display_path()
+        ));
+    }
     let local_discovery = discover_project_sessions(norm_project, &local_harness_dir)?;
 
     let Some(probe) = probe_opt else {
@@ -472,6 +490,13 @@ fn run_session_harness(
 
     let remote_harness_dir = probe.remote_harness_dir(subdir);
     let staging_remote_harness = staging_gemini_root.join(subdir);
+    if config.mode != SyncMode::Inspect {
+        log_substep(&format!(
+            "Staging remote session index from {}:{} ...",
+            probe.endpoint.display_label(),
+            remote_harness_dir
+        ));
+    }
     stage_remote_harness_index(probe, subdir, &staging_remote_harness)?;
 
     let remote_discovery = discover_project_sessions(
@@ -583,6 +608,21 @@ fn run_session_harness(
         });
     }
 
+    log_substep(&format!(
+        "Found {} correlated session(s) in '{}' (Local total: {}): {} to push, {} to pull, {} in-sync delta check",
+        all_cids.len(),
+        kind.cli_id(),
+        format_bytes(local_discovery.total_bytes),
+        pushed_cids.len(),
+        pulled_cids.len(),
+        delta_both_cids.len()
+    ));
+
+    log_progress(&format!(
+        "[3/4] Synchronizing session artifacts & global indexes for '{}' ...",
+        kind.cli_id()
+    ));
+
     let mut local_merge_stats = MergeStats::default();
     let mut remote_merge_stats = MergeStats::default();
 
@@ -607,6 +647,10 @@ fn run_session_harness(
     }
 
     if !pull_rel_set.is_empty() {
+        log_substep(&format!(
+            "Pulling {} session artifact path(s) from Remote -> Local ...",
+            pull_rel_set.len()
+        ));
         remote_checkpoint_or_clean_harness_wals(probe, subdir, &pulled_cids, false, config.dry_run)?;
         let pull_paths: Vec<String> = pull_rel_set.into_iter().collect();
         let update_only = config.mode == SyncMode::Sync;
@@ -646,6 +690,10 @@ fn run_session_harness(
     }
 
     if !pulled_cids.is_empty() && !config.dry_run {
+        log_substep(&format!(
+            "Merging {} pulled session(s) into local SQLite & Protobuf indexes ...",
+            pulled_cids.len()
+        ));
         let remap_pair =
             remap_enabled.then_some((probe.remote_home.as_str(), config.local_home.as_str()));
         let remote_manifest =
@@ -686,6 +734,11 @@ fn run_session_harness(
     }
 
     if !push_rel_set.is_empty() {
+        log_substep(&format!(
+            "Pushing {} session artifact path(s) from Local -> Remote ({}) ...",
+            push_rel_set.len(),
+            format_bytes(local_discovery.total_bytes)
+        ));
         let push_paths: Vec<String> = push_rel_set.into_iter().collect();
         let update_only = config.mode == SyncMode::Sync;
 
@@ -746,6 +799,10 @@ fn run_session_harness(
     }
 
     if !pushed_cids.is_empty() && !config.dry_run {
+        log_substep(&format!(
+            "Merging {} pushed session(s) into remote SQLite & Protobuf indexes ...",
+            pushed_cids.len()
+        ));
         let remap_pair =
             remap_enabled.then_some((config.local_home.as_str(), probe.remote_home.as_str()));
         let local_manifest =
@@ -991,49 +1048,27 @@ pub fn run_engine(config: &EngineConfig) -> Result<SyncReport> {
     };
 
     let probe_opt = if let Some(ref ep) = config.endpoint {
-        Some(probe_remote(ep, &config.local_home, &norm_project)?)
+        if config.mode != SyncMode::Inspect {
+            log_progress(&format!(
+                "[1/4] Probing remote endpoint {} ...",
+                ep.display_label()
+            ));
+        }
+        let p = probe_remote(ep, &config.local_home, &norm_project)?;
+        if config.mode != SyncMode::Inspect {
+            log_substep(&format!("Local Workspace : {}", norm_project.display()));
+            log_substep(&format!("Remote Workspace: {}", p.remote_project_path));
+            log_substep(&format!(
+                "$HOME Remapping : {} <-> {}",
+                config.local_home, p.remote_home
+            ));
+        }
+        Some(p)
     } else if config.mode != SyncMode::Inspect {
         bail!("A remote endpoint (--remote) is required for sync/push/pull");
     } else {
         None
     };
-
-    // 1. If performing Sync/Push/Pull, synchronize the project workspace folder first via rsync -avz
-    if config.mode != SyncMode::Inspect {
-        let probe = probe_opt.as_ref().unwrap();
-        let excludes = build_workspace_excludes(config);
-        match config.mode {
-            SyncMode::Push => {
-                let opts = RsyncTransferOpts {
-                    update_only: false,
-                    delete: config.delete,
-                    dry_run: config.dry_run,
-                    excludes,
-                };
-                rsync_workspace_dir(probe, &norm_project, true, &opts)?;
-            }
-            SyncMode::Pull => {
-                let opts = RsyncTransferOpts {
-                    update_only: false,
-                    delete: config.delete,
-                    dry_run: config.dry_run,
-                    excludes,
-                };
-                rsync_workspace_dir(probe, &norm_project, false, &opts)?;
-            }
-            SyncMode::Sync => {
-                let opts = RsyncTransferOpts {
-                    update_only: true,
-                    delete: false,
-                    dry_run: config.dry_run,
-                    excludes,
-                };
-                rsync_workspace_dir(probe, &norm_project, true, &opts)?;
-                rsync_workspace_dir(probe, &norm_project, false, &opts)?;
-            }
-            SyncMode::Inspect => unreachable!(),
-        }
-    }
 
     let remap_enabled = probe_opt.as_ref().is_some_and(|p| {
         !config.no_remap
@@ -1068,6 +1103,51 @@ pub fn run_engine(config: &EngineConfig) -> Result<SyncReport> {
             )?
         };
         harness_reports.push(hr);
+    }
+
+    // 4. Synchronize the project workspace folder via rsync -avz --partial --progress
+    if config.mode != SyncMode::Inspect {
+        let probe = probe_opt.as_ref().unwrap();
+        let excludes = build_workspace_excludes(config);
+        log_progress(&format!(
+            "[4/4] Synchronizing project workspace folder ({}) ...",
+            norm_project.display()
+        ));
+        match config.mode {
+            SyncMode::Push => {
+                let opts = RsyncTransferOpts {
+                    update_only: false,
+                    delete: config.delete,
+                    dry_run: config.dry_run,
+                    excludes,
+                };
+                log_substep("Pushing workspace files (Local -> Remote) ...");
+                rsync_workspace_dir(probe, &norm_project, true, &opts)?;
+            }
+            SyncMode::Pull => {
+                let opts = RsyncTransferOpts {
+                    update_only: false,
+                    delete: config.delete,
+                    dry_run: config.dry_run,
+                    excludes,
+                };
+                log_substep("Pulling workspace files (Remote -> Local) ...");
+                rsync_workspace_dir(probe, &norm_project, false, &opts)?;
+            }
+            SyncMode::Sync => {
+                let opts = RsyncTransferOpts {
+                    update_only: true,
+                    delete: false,
+                    dry_run: config.dry_run,
+                    excludes,
+                };
+                log_substep("Pushing newer workspace files (Local -> Remote) ...");
+                rsync_workspace_dir(probe, &norm_project, true, &opts)?;
+                log_substep("Pulling newer workspace files (Remote -> Local) ...");
+                rsync_workspace_dir(probe, &norm_project, false, &opts)?;
+            }
+            SyncMode::Inspect => unreachable!(),
+        }
     }
 
     let mut pushed_cids = BTreeSet::new();

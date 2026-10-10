@@ -99,6 +99,13 @@ impl RemoteEndpoint {
             if let Some(cp) = control_path {
                 args.push("-o".to_string());
                 args.push(format!("ControlPath={}", cp.display()));
+            } else {
+                args.push("-o".to_string());
+                args.push("ControlMaster=auto".to_string());
+                args.push("-o".to_string());
+                args.push("ControlPersist=60".to_string());
+                args.push("-o".to_string());
+                args.push("ControlPath=/tmp/agy-sync-mux-%C".to_string());
             }
         }
         args
@@ -119,6 +126,10 @@ impl RemoteEndpoint {
                     " -o ControlPath={}",
                     shell_quote(&cp.to_string_lossy())
                 ));
+            } else {
+                cmd.push_str(
+                    " -o ControlMaster=auto -o ControlPersist=60 -o ControlPath=/tmp/agy-sync-mux-%C",
+                );
             }
         }
         cmd
@@ -729,7 +740,10 @@ pub fn rsync_workspace_dir(
     };
 
     let mut cmd = Command::new("rsync");
-    cmd.arg("-avz");
+    cmd.arg("-avz")
+        .arg("-h")
+        .arg("--partial")
+        .arg("--progress");
     if opts.update_only {
         cmd.arg("-u");
     }
@@ -752,15 +766,12 @@ pub fn rsync_workspace_dir(
         cmd.arg(&remote_slash).arg(&local_slash);
     }
 
-    let out = cmd.output().context("Failed to execute rsync for workspace")?;
-    if !out.status.success() {
-        bail!(
-            "Workspace rsync failed (status {}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+    cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    let status = cmd.status().context("Failed to execute rsync for workspace")?;
+    if !status.success() {
+        bail!("Workspace rsync failed (status {})", status);
     }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    Ok(String::new())
 }
 
 /// Synchronizes a specific list of relative paths inside a harness directory (or `.gemini` root when `harness_subdir == ""`)
@@ -803,6 +814,9 @@ pub fn rsync_harness_relative_paths(
 
     let mut cmd = Command::new("rsync");
     cmd.arg("-avz")
+        .arg("-h")
+        .arg("--partial")
+        .arg("--progress")
         .arg("-r")
         .arg("--files-from")
         .arg(list_file.path());
@@ -823,15 +837,12 @@ pub fn rsync_harness_relative_paths(
         cmd.arg(&remote_slash).arg(&local_slash);
     }
 
-    let out = cmd
-        .output()
+    cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    let status = cmd
+        .status()
         .context("Failed to execute rsync --files-from for harness artifacts")?;
-    if !out.status.success() {
-        bail!(
-            "Harness artifacts rsync failed (status {}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+    if !status.success() {
+        bail!("Harness artifacts rsync failed (status {})", status);
     }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    Ok(String::new())
 }
