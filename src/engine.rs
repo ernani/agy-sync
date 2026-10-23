@@ -1,13 +1,14 @@
 use crate::discovery::{
-    discover_project_sessions, is_home_or_root_path, normalize_project_path, ProjectDiscovery,
+    discover_project_sessions, is_home_or_root_path, normalize_project_path, path_to_file_uri,
+    ProjectDiscovery,
 };
 use crate::harnesses::{
     discover_single_harness, merge_legacy_gemini_cli_metadata, sync_config_project_files,
     HarnessKind,
 };
 use crate::index_merge::{
-    export_project_manifest, find_sessions_with_home_prefix, merge_project_manifest,
-    remap_conversation_artifacts, MergeStats,
+    export_project_manifest, find_sessions_with_home_prefix, home_search_needles,
+    merge_project_manifest, remap_conversation_artifacts, MergeStats,
 };
 use crate::transport::{
     ensure_sufficient_fd_limit, probe_remote, push_staged_remote_harness_index,
@@ -731,11 +732,12 @@ fn run_session_harness(
     if remap_enabled && !config.dry_run {
         let mut self_heal_cids =
             find_sessions_with_home_prefix(&local_harness_dir, &probe.remote_home);
+        let remote_needles = home_search_needles(&probe.remote_home);
         for (cid, sess) in &local_discovery.sessions {
             if sess
                 .workspace_uris
                 .iter()
-                .any(|u| u.contains(&probe.remote_home))
+                .any(|u| remote_needles.iter().any(|n| u.contains(n)))
             {
                 self_heal_cids.insert(cid.clone());
             }
@@ -1253,7 +1255,7 @@ pub fn run_engine(config: &EngineConfig) -> Result<SyncReport> {
             discover_project_sessions(&norm_project, &fallback_harness_dir).unwrap_or(
                 ProjectDiscovery {
                     project_path: norm_project.clone(),
-                    project_uri: format!("file://{}", norm_project.display()),
+                    project_uri: path_to_file_uri(&norm_project),
                     harness_dir: fallback_harness_dir,
                     sessions: BTreeMap::new(),
                     knowledge_paths: Vec::new(),

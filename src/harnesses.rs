@@ -1,8 +1,9 @@
 use crate::discovery::{
     clean_prompt_text, compute_path_size, discover_project_sessions,
     find_matching_config_project_ids, find_summary_pb_files, normalize_project_path,
-    uri_matches_project, ProjectDiscovery,
+    path_to_file_uri, raw_path_to_file_uri, uri_matches_project, ProjectDiscovery,
 };
+use crate::index_merge::apply_home_remap_str;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -272,7 +273,7 @@ fn format_system_time_epoch(path: &Path) -> String {
 
 fn discover_agy_ide_plugins(project_path: &Path, gemini_root: &Path) -> Result<HarnessDiscovery> {
     let norm_project = normalize_project_path(project_path);
-    let project_uri = format!("file://{}", norm_project.display());
+    let project_uri = path_to_file_uri(&norm_project);
     let matched_ids = find_matching_config_project_ids(gemini_root, &project_uri);
 
     let mut rel_paths = Vec::new();
@@ -328,8 +329,7 @@ fn discover_gemini_cli_legacy(
     gemini_root: &Path,
 ) -> Result<HarnessDiscovery> {
     let norm_project = normalize_project_path(project_path);
-    let norm_project_str = norm_project.to_string_lossy().to_string();
-    let project_uri = format!("file://{}", norm_project_str);
+    let project_uri = path_to_file_uri(&norm_project);
 
     let mut matched_slug: Option<String> = None;
 
@@ -339,7 +339,7 @@ fn discover_gemini_cli_legacy(
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
             if let Some(map) = val.get("projects").and_then(|p| p.as_object()) {
                 for (path_key, slug_val) in map {
-                    let key_uri = format!("file://{}", path_key.trim_end_matches('/'));
+                    let key_uri = raw_path_to_file_uri(path_key);
                     if uri_matches_project(&key_uri, &project_uri) {
                         if let Some(slug) = slug_val.as_str() {
                             matched_slug = Some(slug.to_string());
@@ -361,7 +361,7 @@ fn discover_gemini_cli_legacy(
             for entry in entries.flatten() {
                 let pr_file = entry.path().join(".project_root");
                 if let Ok(root_text) = fs::read_to_string(&pr_file) {
-                    let root_uri = format!("file://{}", root_text.trim().trim_end_matches('/'));
+                    let root_uri = raw_path_to_file_uri(root_text.trim());
                     if uri_matches_project(&root_uri, &project_uri) {
                         matched_slug = Some(entry.file_name().to_string_lossy().to_string());
                         break;
@@ -461,11 +461,7 @@ pub fn sync_config_project_files(
         }
         let mut content = fs::read_to_string(&src_file)?;
         if let Some((from_h, to_h)) = remap_homes {
-            let f_trim = from_h.trim_end_matches('/');
-            let t_trim = to_h.trim_end_matches('/');
-            if !f_trim.is_empty() && f_trim != t_trim {
-                content = content.replace(f_trim, t_trim);
-            }
+            content = apply_home_remap_str(&content, from_h, to_h);
         }
         let dst_file = dst_projects_dir.join(format!("{}.json", id));
         fs::write(&dst_file, content)?;
@@ -505,16 +501,12 @@ pub fn merge_legacy_gemini_cli_metadata(
     fs::write(&projects_json_path, formatted)?;
 
     if let Some((from_h, to_h)) = remap_homes {
-        let f_trim = from_h.trim_end_matches('/');
-        let t_trim = to_h.trim_end_matches('/');
-        if !f_trim.is_empty() && f_trim != t_trim {
-            for sub in ["history", "tmp"] {
-                let pr_file = dst_gemini_root.join(sub).join(slug).join(".project_root");
-                if let Ok(content) = fs::read_to_string(&pr_file) {
-                    let updated = content.replace(f_trim, t_trim);
-                    if updated != content {
-                        let _ = fs::write(&pr_file, updated);
-                    }
+        for sub in ["history", "tmp"] {
+            let pr_file = dst_gemini_root.join(sub).join(slug).join(".project_root");
+            if let Ok(content) = fs::read_to_string(&pr_file) {
+                let updated = apply_home_remap_str(&content, from_h, to_h);
+                if updated != content {
+                    let _ = fs::write(&pr_file, updated);
                 }
             }
         }

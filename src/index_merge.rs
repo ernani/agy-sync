@@ -137,6 +137,119 @@ fn col_to_str(row: &rusqlite::Row<'_>, idx: usize) -> String {
     String::new()
 }
 
+fn is_windows_drive_home(norm_home: &str) -> bool {
+    norm_home.len() >= 3
+        && norm_home.as_bytes()[0].is_ascii_alphabetic()
+        && norm_home.as_bytes()[1] == b':'
+        && norm_home.as_bytes()[2] == b'/'
+}
+
+/// Builds an ordered list of `(from_pattern, to_pattern)` pairs for remapping `$HOME` strings
+/// across POSIX (`/Users/<user>`, `/home/<user>`), ChromeOS (`/mnt/chromeos/MyFiles`),
+/// and native Windows (`C:/Users/<user>`, `C:\Users\<user>`, `file:///c%3A/Users/<user>`).
+pub fn build_home_remap_pairs(from_home: &str, to_home: &str) -> Vec<(String, String)> {
+    let f_norm = crate::config::normalize_home_path_string(from_home);
+    let t_norm = crate::config::normalize_home_path_string(to_home);
+    if f_norm.is_empty() || t_norm.is_empty() || f_norm == t_norm {
+        return Vec::new();
+    }
+
+    let from_win = is_windows_drive_home(&f_norm);
+    let to_win = is_windows_drive_home(&t_norm);
+
+    if from_win && !to_win {
+        let drive_upper = (f_norm.as_bytes()[0] as char).to_ascii_uppercase();
+        let drive_lower = (f_norm.as_bytes()[0] as char).to_ascii_lowercase();
+        let rest = &f_norm[2..]; // e.g. `/Users/devuser`
+        let rest_backslash = rest.replace('/', "\\");
+        let rest_json_backslash = rest.replace('/', "\\\\");
+
+        vec![
+            (format!("/{}:{}", drive_upper, rest), t_norm.clone()),
+            (format!("/{}:{}", drive_lower, rest), t_norm.clone()),
+            (format!("/{}%3A{}", drive_upper, rest), t_norm.clone()),
+            (format!("/{}%3A{}", drive_lower, rest), t_norm.clone()),
+            (format!("/{}%3a{}", drive_upper, rest), t_norm.clone()),
+            (format!("/{}%3a{}", drive_lower, rest), t_norm.clone()),
+            (
+                format!("{}:{}", drive_upper, rest_json_backslash),
+                t_norm.clone(),
+            ),
+            (
+                format!("{}:{}", drive_lower, rest_json_backslash),
+                t_norm.clone(),
+            ),
+            (
+                format!("{}:{}", drive_upper, rest_backslash),
+                t_norm.clone(),
+            ),
+            (
+                format!("{}:{}", drive_lower, rest_backslash),
+                t_norm.clone(),
+            ),
+            (format!("{}:{}", drive_upper, rest), t_norm.clone()),
+            (format!("{}:{}", drive_lower, rest), t_norm),
+        ]
+    } else if !from_win && to_win {
+        let drive_upper = (t_norm.as_bytes()[0] as char).to_ascii_uppercase();
+        let t_canonical = format!("{}:{}", drive_upper, &t_norm[2..]);
+        vec![
+            (f_norm, t_canonical),
+            (
+                format!("file://{}:/", drive_upper),
+                format!("file:///{}:/", drive_upper),
+            ),
+        ]
+    } else {
+        vec![(f_norm, t_norm)]
+    }
+}
+
+/// Applies all `(from_pattern, to_pattern)` pairs from `build_home_remap_pairs` to a UTF-8 string.
+pub fn apply_home_remap_str(input: &str, from_home: &str, to_home: &str) -> String {
+    let mut out = input.to_string();
+    for (f, t) in build_home_remap_pairs(from_home, to_home) {
+        if out.contains(&f) {
+            out = out.replace(&f, &t);
+        }
+    }
+    out
+}
+
+/// Applies all `(from_pattern, to_pattern)` pairs from `build_home_remap_pairs` to a Protobuf byte slice.
+pub fn apply_home_remap_protobuf(bytes: &[u8], from_home: &str, to_home: &str) -> Vec<u8> {
+    let mut current = bytes.to_vec();
+    for (f, t) in build_home_remap_pairs(from_home, to_home) {
+        if let Ok(rewritten) = rewrite_protobuf_strings(&current, &f, &t) {
+            current = rewritten;
+        }
+    }
+    current
+}
+
+/// Returns all string patterns that identify `foreign_home` inside SQLite/Protobuf/URI blobs.
+pub fn home_search_needles(foreign_home: &str) -> Vec<String> {
+    let norm = crate::config::normalize_home_path_string(foreign_home);
+    if norm.is_empty() {
+        return Vec::new();
+    }
+    if is_windows_drive_home(&norm) {
+        let drive_upper = (norm.as_bytes()[0] as char).to_ascii_uppercase();
+        let drive_lower = (norm.as_bytes()[0] as char).to_ascii_lowercase();
+        let rest = &norm[2..];
+        vec![
+            format!("{}:{}", drive_upper, rest),
+            format!("{}:{}", drive_lower, rest),
+            format!("{}%3A{}", drive_upper, rest),
+            format!("{}%3A{}", drive_lower, rest),
+            format!("{}%3a{}", drive_upper, rest),
+            format!("{}%3a{}", drive_lower, rest),
+        ]
+    } else {
+        vec![norm]
+    }
+}
+
 /// Exports the SQLite summary rows, FTS search chunks, and `*_summaries_proto.pb` entries
 /// for `conversation_ids` from `harness_dir`, optionally remapping `$HOME` paths (`from_home` -> `to_home`).
 pub fn export_project_manifest(
@@ -196,14 +309,12 @@ pub fn export_project_manifest(
             if let Some(mut s_row) = row_opt {
                 if let Some((from_h, to_h)) = remap_homes {
                     if !from_h.is_empty() && from_h != to_h {
-                        s_row.workspace_uris = s_row.workspace_uris.replace(from_h, to_h);
-                        s_row.preview = s_row.preview.replace(from_h, to_h);
+                        s_row.workspace_uris =
+                            apply_home_remap_str(&s_row.workspace_uris, from_h, to_h);
+                        s_row.preview = apply_home_remap_str(&s_row.preview, from_h, to_h);
                         if !s_row.raw_summary.is_empty() {
-                            if let Ok(rewritten) =
-                                rewrite_protobuf_strings(&s_row.raw_summary, from_h, to_h)
-                            {
-                                s_row.raw_summary = rewritten;
-                            }
+                            s_row.raw_summary =
+                                apply_home_remap_protobuf(&s_row.raw_summary, from_h, to_h);
                         }
                     }
                 }
@@ -242,9 +353,12 @@ pub fn export_project_manifest(
                             let mut c_row = c;
                             if let Some((from_h, to_h)) = remap_homes {
                                 if !from_h.is_empty() && from_h != to_h {
-                                    c_row.workspace = c_row.workspace.replace(from_h, to_h);
-                                    c_row.user_body = c_row.user_body.replace(from_h, to_h);
-                                    c_row.agent_body = c_row.agent_body.replace(from_h, to_h);
+                                    c_row.workspace =
+                                        apply_home_remap_str(&c_row.workspace, from_h, to_h);
+                                    c_row.user_body =
+                                        apply_home_remap_str(&c_row.user_body, from_h, to_h);
+                                    c_row.agent_body =
+                                        apply_home_remap_str(&c_row.agent_body, from_h, to_h);
                                 }
                             }
                             manifest.fts_chunks.push(c_row);
@@ -266,8 +380,7 @@ pub fn export_project_manifest(
             for cid in conversation_ids {
                 if let Some(raw_bytes) = pb_map.get(cid) {
                     let entry_bytes = if let Some((from_h, to_h)) = remap_homes {
-                        rewrite_protobuf_strings(raw_bytes, from_h, to_h)
-                            .unwrap_or_else(|_| raw_bytes.to_vec())
+                        apply_home_remap_protobuf(raw_bytes, from_h, to_h)
                     } else {
                         raw_bytes.to_vec()
                     };
@@ -484,32 +597,28 @@ pub fn merge_project_manifest(
 
 /// Returns all conversation IDs in `harness_dir` whose global summary row (`conversation_summaries.db`),
 /// per-conversation SQLite metadata (`conversations/<id>.db` -> `trajectory_metadata_blob`),
-/// or implicit protobuf (`implicit/<id>.pb`) contains `foreign_home`.
+/// or implicit protobuf (`implicit/<id>.pb`) contains `foreign_home` (including Windows URI variants).
 pub fn find_sessions_with_home_prefix(harness_dir: &Path, foreign_home: &str) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
-    let trimmed = foreign_home.trim_end_matches('/');
-    if trimmed.is_empty() {
+    let needles = home_search_needles(foreign_home);
+    if needles.is_empty() {
         return found;
     }
-    let needle = trimmed.as_bytes();
 
     // 1. Check global conversation_summaries.db
     let db_path = harness_dir.join("conversation_summaries.db");
     if db_path.exists() {
         if let Ok(conn) = Connection::open(&db_path) {
             let _ = conn.busy_timeout(std::time::Duration::from_millis(2000));
-            let pattern = format!("%{}%", trimmed);
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT conversation_id, raw_summary FROM conversation_summaries WHERE workspace_uris LIKE ?1 OR preview LIKE ?1",
-            ) {
-                if let Ok(rows) = stmt.query_map([&pattern], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default(),
-                    ))
-                }) {
-                    for (cid, _) in rows.flatten() {
-                        found.insert(cid);
+            for needle_str in &needles {
+                let pattern = format!("%{}%", needle_str);
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT conversation_id FROM conversation_summaries WHERE workspace_uris LIKE ?1 OR preview LIKE ?1",
+                ) {
+                    if let Ok(rows) = stmt.query_map([&pattern], |r| r.get::<_, String>(0)) {
+                        for cid in rows.flatten() {
+                            found.insert(cid);
+                        }
                     }
                 }
             }
@@ -539,7 +648,10 @@ pub fn find_sessions_with_home_prefix(harness_dir: &Path, foreign_home: &str) ->
                 if let Ok(mut stmt) = conn.prepare("SELECT data FROM trajectory_metadata_blob") {
                     if let Ok(rows) = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0)) {
                         for blob in rows.flatten() {
-                            if blob.windows(needle.len()).any(|w| w == needle) {
+                            if needles.iter().any(|n| {
+                                let nb = n.as_bytes();
+                                !nb.is_empty() && blob.windows(nb.len()).any(|w| w == nb)
+                            }) {
                                 found.insert(stem.to_string());
                                 break;
                             }
@@ -565,7 +677,10 @@ pub fn find_sessions_with_home_prefix(harness_dir: &Path, foreign_home: &str) ->
                 continue;
             }
             if let Ok(bytes) = fs::read(&path) {
-                if bytes.windows(needle.len()).any(|w| w == needle) {
+                if needles.iter().any(|n| {
+                    let nb = n.as_bytes();
+                    !nb.is_empty() && bytes.windows(nb.len()).any(|w| w == nb)
+                }) {
                     found.insert(stem.to_string());
                 }
             }
@@ -586,25 +701,22 @@ pub fn remap_conversation_artifacts(
     to_home: &str,
     deep_remap: bool,
 ) -> Result<()> {
-    let from_h = from_home.trim_end_matches('/');
-    let to_h = to_home.trim_end_matches('/');
-    if from_h.is_empty() || to_h.is_empty() || from_h == to_h {
+    if build_home_remap_pairs(from_home, to_home).is_empty() {
         return Ok(());
     }
 
     for cid in conversation_ids {
         let conv_db_path = harness_dir.join("conversations").join(format!("{}.db", cid));
         if conv_db_path.exists() {
-            remap_single_conversation_db(&conv_db_path, from_h, to_h, deep_remap)?;
+            remap_single_conversation_db(&conv_db_path, from_home, to_home, deep_remap)?;
         }
 
         let implicit_path = harness_dir.join("implicit").join(format!("{}.pb", cid));
         if implicit_path.exists() {
             if let Ok(bytes) = fs::read(&implicit_path) {
-                if let Ok(rewritten) = rewrite_protobuf_strings(&bytes, from_h, to_h) {
-                    if rewritten != bytes {
-                        fs::write(&implicit_path, rewritten)?;
-                    }
+                let rewritten = apply_home_remap_protobuf(&bytes, from_home, to_home);
+                if rewritten != bytes {
+                    fs::write(&implicit_path, rewritten)?;
                 }
             }
         }
@@ -619,8 +731,8 @@ pub fn remap_conversation_artifacts(
                 let p = logs_dir.join(name);
                 if p.exists() {
                     if let Ok(text) = fs::read_to_string(&p) {
-                        if text.contains(from_h) {
-                            let updated = text.replace(from_h, to_h);
+                        let updated = apply_home_remap_str(&text, from_home, to_home);
+                        if updated != text {
                             fs::write(&p, updated)?;
                         }
                     }
@@ -660,13 +772,12 @@ fn remap_single_conversation_db(
         };
 
         for (id, blob) in rows {
-            if let Ok(rewritten) = rewrite_protobuf_strings(&blob, from_h, to_h) {
-                if rewritten != blob {
-                    tx.execute(
-                        "UPDATE trajectory_metadata_blob SET data = ?1 WHERE id = ?2",
-                        params![rewritten, id],
-                    )?;
-                }
+            let rewritten = apply_home_remap_protobuf(&blob, from_h, to_h);
+            if rewritten != blob {
+                tx.execute(
+                    "UPDATE trajectory_metadata_blob SET data = ?1 WHERE id = ?2",
+                    params![rewritten, id],
+                )?;
             }
         }
         tx.commit()?;
@@ -689,9 +800,8 @@ fn remap_single_conversation_db(
                 mapped.flatten().collect()
             };
             for (idx, meta, payload) in rows {
-                let new_meta = rewrite_protobuf_strings(&meta, from_h, to_h).unwrap_or(meta.clone());
-                let new_payload =
-                    rewrite_protobuf_strings(&payload, from_h, to_h).unwrap_or(payload.clone());
+                let new_meta = apply_home_remap_protobuf(&meta, from_h, to_h);
+                let new_payload = apply_home_remap_protobuf(&payload, from_h, to_h);
                 if new_meta != meta || new_payload != payload {
                     tx.execute(
                         "UPDATE steps SET metadata = ?1, step_payload = ?2 WHERE idx = ?3",
@@ -826,5 +936,43 @@ mod tests {
         assert_eq!(merged_pb.len(), 2);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_windows_to_posix_and_back_home_remapping() {
+        let win_home = r"C:\Users\devuser";
+        let linux_home = "/home/devuser";
+
+        // Windows -> Linux
+        let remapped_to_linux = apply_home_remap_str(
+            r#"["file:///C:/Users/devuser/proj","file:///c%3A/Users/devuser/proj","C:\\Users\\devuser\\proj"]"#,
+            win_home,
+            linux_home,
+        );
+        assert_eq!(
+            remapped_to_linux,
+            r#"["file:///home/devuser/proj","file:///home/devuser/proj","/home/devuser\\proj"]"#
+        );
+
+        let pb_win = make_dummy_proto_with_uri("file:///c%3A/Users/devuser/proj");
+        let pb_linux = apply_home_remap_protobuf(&pb_win, win_home, linux_home);
+        assert_eq!(pb_linux, make_dummy_proto_with_uri("file:///home/devuser/proj"));
+
+        // Linux -> Windows
+        let remapped_to_win = apply_home_remap_str(
+            r#"["file:///home/devuser/proj","/home/devuser/proj"]"#,
+            linux_home,
+            win_home,
+        );
+        assert_eq!(
+            remapped_to_win,
+            r#"["file:///C:/Users/devuser/proj","C:/Users/devuser/proj"]"#
+        );
+
+        let pb_back_to_win = apply_home_remap_protobuf(&pb_linux, linux_home, win_home);
+        assert_eq!(
+            pb_back_to_win,
+            make_dummy_proto_with_uri("file:///C:/Users/devuser/proj")
+        );
     }
 }

@@ -54,20 +54,95 @@ impl ProjectDiscovery {
     }
 }
 
-/// Normalize a project path (strip trailing slashes, canonicalize if existing).
+/// Normalize a project path (strip Windows verbatim prefixes, convert `\` to `/`, strip trailing slashes, canonicalize if existing).
 pub fn normalize_project_path(path: &Path) -> PathBuf {
     let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let s = canonical.to_string_lossy().trim_end_matches('/').to_string();
-    PathBuf::from(if s.is_empty() { "/" } else { &s })
+    let norm = crate::config::normalize_home_path_string(&canonical.to_string_lossy());
+    PathBuf::from(if norm.is_empty() { "/" } else { &norm })
+}
+
+/// Converts a raw filesystem path or existing `file://` URI into a canonical `file://` URI
+/// (`file:///Users/...` on POSIX or `file:///C:/Users/...` on Windows).
+pub fn raw_path_to_file_uri(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(after_scheme) = trimmed.strip_prefix("file://") {
+        let mut s = after_scheme
+            .replace('\\', "/")
+            .replace("%3A/", ":/")
+            .replace("%3a/", ":/");
+        if s.len() >= 3 && s.starts_with('/') && s.as_bytes()[2] == b':' {
+            // Already has leading slash before drive letter: `/C:/Users/...`
+            if let Some(first) = s.get(1..2) {
+                s = format!("/{}{}", first.to_ascii_uppercase(), &s[2..]);
+            }
+            return format!("file://{}", s.trim_end_matches('/'));
+        }
+        if s.len() >= 2 && s.as_bytes()[1] == b':' {
+            let drive = s[..1].to_ascii_uppercase();
+            return format!("file:///{}{}", drive, s[1..].trim_end_matches('/'));
+        }
+        return format!("file://{}", s.trim_end_matches('/'));
+    }
+    let norm = crate::config::normalize_home_path_string(trimmed);
+    if norm.len() >= 2 && norm.as_bytes()[1] == b':' {
+        let drive = norm[..1].to_ascii_uppercase();
+        format!("file:///{}{}", drive, &norm[1..])
+    } else if norm.starts_with('/') {
+        format!("file://{}", norm)
+    } else {
+        format!("file:///{}", norm)
+    }
+}
+
+/// Converts a `Path` into a canonical `file://` URI.
+pub fn path_to_file_uri(path: &Path) -> String {
+    raw_path_to_file_uri(&path.to_string_lossy())
 }
 
 /// Extracts `(home_dir, username, relative_path)` from a filesystem path or `file://` URI
-/// for standard Unix/macOS home directories (`/Users/<user>[/...]` or `[/usr/...]/home/<user>[/...]`).
-pub fn split_home_and_relative(raw: &str) -> Option<(&str, &str, &str)> {
-    let path = raw
-        .strip_prefix("file://")
-        .unwrap_or(raw)
-        .trim_end_matches('/');
+/// across macOS (`/Users/<user>`), Linux/WSL2/ChromeOS Crostini (`[/usr/...]/home/<user>`),
+/// native Windows (`C:/Users/<user>`, `C:\Users\<user>`, `file:///c%3A/Users/<user>`),
+/// and ChromeOS shared folders (`/mnt/chromeos/MyFiles`).
+pub fn split_home_and_relative(raw: &str) -> Option<(String, String, String)> {
+    let without_scheme = raw.trim().strip_prefix("file://").unwrap_or(raw.trim());
+    let mut cleaned = crate::config::normalize_home_path_string(without_scheme)
+        .replace("%3A/", ":/")
+        .replace("%3a/", ":/");
+    if cleaned.len() >= 3
+        && cleaned.starts_with('/')
+        && cleaned.as_bytes()[1].is_ascii_alphabetic()
+        && cleaned.as_bytes()[2] == b':'
+    {
+        cleaned.remove(0);
+    }
+    let path = cleaned.trim_end_matches('/');
+
+    // 1. Native Windows drive Users path: `C:/Users/<user>[/...]`
+    if path.len() >= 9
+        && path.as_bytes()[0].is_ascii_alphabetic()
+        && path.as_bytes()[1] == b':'
+        && path[2..].to_ascii_lowercase().starts_with("/users/")
+    {
+        let drive = (path.as_bytes()[0] as char).to_ascii_uppercase();
+        let after_users = &path[9..];
+        if after_users.is_empty() {
+            return None;
+        }
+        return match after_users.find('/') {
+            Some(idx) => {
+                let user = &after_users[..idx];
+                let home = format!("{}:/Users/{}", drive, user);
+                let rel = &after_users[idx..];
+                Some((home, user.to_string(), rel.to_string()))
+            }
+            None => {
+                let home = format!("{}:/Users/{}", drive, after_users);
+                Some((home, after_users.to_string(), String::new()))
+            }
+        };
+    }
+
+    // 2. macOS `/Users/<user>[/...]`
     if let Some(after_users) = path.strip_prefix("/Users/") {
         if after_users.is_empty() {
             return None;
@@ -77,11 +152,13 @@ pub fn split_home_and_relative(raw: &str) -> Option<(&str, &str, &str)> {
                 let user = &after_users[..idx];
                 let home = &path[..7 + idx];
                 let rel = &after_users[idx..];
-                Some((home, user, rel))
+                Some((home.to_string(), user.to_string(), rel.to_string()))
             }
-            None => Some((path, after_users, "")),
+            None => Some((path.to_string(), after_users.to_string(), String::new())),
         };
     }
+
+    // 3. Linux / WSL2 / ChromeOS Crostini `[/usr/...]/home/<user>[/...]`
     if path.starts_with("/home/") || path.starts_with("/usr/") {
         if let Some(pos) = path.find("/home/") {
             let after_home = &path[pos + 6..];
@@ -93,24 +170,58 @@ pub fn split_home_and_relative(raw: &str) -> Option<(&str, &str, &str)> {
                     let user = &after_home[..idx];
                     let home = &path[..pos + 6 + idx];
                     let rel = &after_home[idx..];
-                    Some((home, user, rel))
+                    Some((home.to_string(), user.to_string(), rel.to_string()))
                 }
-                None => Some((path, after_home, "")),
+                None => Some((path.to_string(), after_home.to_string(), String::new())),
             };
         }
     }
+
+    // 4. ChromeOS shared MyFiles mount `/mnt/chromeos/MyFiles[/...]`
+    if let Some(after_myfiles) = path.strip_prefix("/mnt/chromeos/MyFiles") {
+        if after_myfiles.is_empty() {
+            return Some((
+                "/mnt/chromeos/MyFiles".to_string(),
+                "*".to_string(),
+                String::new(),
+            ));
+        }
+        if after_myfiles.starts_with('/') {
+            return Some((
+                "/mnt/chromeos/MyFiles".to_string(),
+                "*".to_string(),
+                after_myfiles.to_string(),
+            ));
+        }
+    }
+
     None
 }
 
-/// Returns true if `path` is a user `$HOME` directory root (or filesystem root `/`).
+/// Returns true if `path` is a user `$HOME` directory root (or filesystem root `/`, `C:/`, `C:/Users`).
 pub fn is_home_or_root_path(path: &Path, local_home: &str) -> bool {
     let norm = normalize_project_path(path);
-    let s = norm.to_string_lossy();
+    let s = crate::config::normalize_home_path_string(&norm.to_string_lossy());
     let trimmed = s.trim_end_matches('/');
-    if trimmed.is_empty() || trimmed == "/" || trimmed == "/Users" || trimmed == "/home" {
+    if trimmed.is_empty()
+        || trimmed == "/"
+        || trimmed == "/Users"
+        || trimmed == "/home"
+        || trimmed == "/mnt/chromeos/MyFiles"
+    {
         return true;
     }
-    if !local_home.is_empty() && trimmed == local_home.trim_end_matches('/') {
+    if trimmed.len() == 2 && trimmed.as_bytes()[1] == b':' {
+        return true;
+    }
+    if trimmed.len() == 8
+        && trimmed.as_bytes()[1] == b':'
+        && trimmed[2..].eq_ignore_ascii_case("/users")
+    {
+        return true;
+    }
+    let norm_local_home = crate::config::normalize_home_path_string(local_home);
+    if !norm_local_home.is_empty() && trimmed.eq_ignore_ascii_case(&norm_local_home) {
         return true;
     }
     if let Some((_, _, rel)) = split_home_and_relative(trimmed) {
@@ -126,8 +237,9 @@ pub fn is_home_or_root_path(path: &Path, local_home: &str) -> bool {
 /// Special cases:
 /// 1. If `project_uri` is a user's `$HOME` root (`rel == ""`), only an exact match is allowed
 ///    so running in `$HOME` never sweeps up child projects under `~/Documents/...`.
-/// 2. If `uri` and `project_uri` belong to the same username (`user_u == user_p`) under different
-///    OS `$HOME` mount points (e.g. macOS `/Users/<user>/...` vs Linux `[.../]/home/<user>/...`),
+/// 2. If `uri` and `project_uri` belong to the same username (`user_u == user_p`, case-insensitive,
+///    or wildcard `*` for ChromeOS `/mnt/chromeos/MyFiles`) under different OS `$HOME` mount points
+///    (e.g. macOS `/Users/<user>/...`, Linux `[.../]/home/<user>/...`, Windows `C:/Users/<user>/...`),
 ///    their relative project paths are compared so unremapped sessions are still discovered.
 pub fn uri_matches_project(uri: &str, project_uri: &str) -> bool {
     let u = uri.trim_end_matches('/');
@@ -136,14 +248,16 @@ pub fn uri_matches_project(uri: &str, project_uri: &str) -> bool {
     if let (Some((_, user_u, rel_u)), Some((_, user_p, rel_p))) =
         (split_home_and_relative(u), split_home_and_relative(p))
     {
+        let same_user =
+            user_u == "*" || user_p == "*" || user_u.eq_ignore_ascii_case(&user_p);
         if rel_p.is_empty() {
-            return user_u == user_p && rel_u.is_empty();
+            return same_user && rel_u.is_empty();
         }
-        if user_u == user_p {
+        if same_user {
             if rel_u == rel_p {
                 return true;
             }
-            if let Some(rest) = rel_u.strip_prefix(rel_p) {
+            if let Some(rest) = rel_u.strip_prefix(&rel_p) {
                 return rest.starts_with('/');
             }
             return false;
@@ -470,7 +584,7 @@ pub fn discover_project_sessions(
 ) -> Result<ProjectDiscovery> {
     let norm_project = normalize_project_path(project_path);
     let project_path_str = norm_project.to_string_lossy().to_string();
-    let project_uri = format!("file://{}", project_path_str);
+    let project_uri = path_to_file_uri(&norm_project);
 
     // Check parent ~/.gemini/config/projects/*.json if harness_dir is inside ~/.gemini/<harness>
     let matched_project_ids = if let Some(gemini_root) = harness_dir.parent() {
@@ -495,7 +609,7 @@ pub fn discover_project_sessions(
                 history_prompts.insert(sid.to_string(), prompt.to_string());
             }
             if let Some(cwd) = val.get("cwd").and_then(|v| v.as_str()) {
-                let cwd_uri = format!("file://{}", cwd.trim_end_matches('/'));
+                let cwd_uri = raw_path_to_file_uri(cwd);
                 if uri_matches_project(&cwd_uri, &project_uri) {
                     history_matched_cids.insert(sid.to_string());
                 }
@@ -933,6 +1047,28 @@ mod tests {
         assert!(!uri_matches_project(
             "file:///usr/local/corp/home/bob/Documents/my-project",
             "file:///Users/alice/Documents/my-project"
+        ));
+
+        // 4. Native Windows (drive letters, backslashes, VS Code %3A encoding) & ChromeOS MyFiles
+        assert!(uri_matches_project(
+            "file:///C:/Users/alice/Documents/my-project",
+            "file:///Users/alice/Documents/my-project"
+        ));
+        assert!(uri_matches_project(
+            "file:///c%3A/Users/Alice/Documents/my-project/src",
+            "file:///usr/local/corp/home/alice/Documents/my-project"
+        ));
+        assert!(uri_matches_project(
+            r"C:\Users\alice\Documents\my-project",
+            "file:///Users/alice/Documents/my-project"
+        ));
+        assert!(uri_matches_project(
+            "file:///mnt/chromeos/MyFiles/Documents/my-project",
+            "file:///Users/alice/Documents/my-project"
+        ));
+        assert!(!uri_matches_project(
+            "file:///C:/Users/alice/Documents/my-project",
+            "file:///C:/Users/alice"
         ));
     }
 }

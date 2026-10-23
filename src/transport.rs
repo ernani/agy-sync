@@ -3,6 +3,7 @@ use crate::discovery::find_summary_pb_files;
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -96,16 +97,23 @@ impl RemoteEndpoint {
                 args.push("-p".to_string());
                 args.push(p.to_string());
             }
-            if let Some(cp) = control_path {
-                args.push("-o".to_string());
-                args.push(format!("ControlPath={}", cp.display()));
-            } else {
-                args.push("-o".to_string());
-                args.push("ControlMaster=auto".to_string());
-                args.push("-o".to_string());
-                args.push("ControlPersist=4h".to_string());
-                args.push("-o".to_string());
-                args.push("ControlPath=/tmp/agy-sync-mux-%C".to_string());
+            #[cfg(not(windows))]
+            {
+                if let Some(cp) = control_path {
+                    args.push("-o".to_string());
+                    args.push(format!("ControlPath={}", cp.display()));
+                } else {
+                    args.push("-o".to_string());
+                    args.push("ControlMaster=auto".to_string());
+                    args.push("-o".to_string());
+                    args.push("ControlPersist=4h".to_string());
+                    args.push("-o".to_string());
+                    args.push("ControlPath=/tmp/agy-sync-mux-%C".to_string());
+                }
+            }
+            #[cfg(windows)]
+            {
+                let _ = control_path;
             }
         }
         args
@@ -121,15 +129,22 @@ impl RemoteEndpoint {
             if let Some(p) = port {
                 cmd.push_str(&format!(" -p {}", p));
             }
-            if let Some(cp) = control_path {
-                cmd.push_str(&format!(
-                    " -o ControlPath={}",
-                    shell_quote(&cp.to_string_lossy())
-                ));
-            } else {
-                cmd.push_str(
-                    " -o ControlMaster=auto -o ControlPersist=4h -o ControlPath=/tmp/agy-sync-mux-%C",
-                );
+            #[cfg(not(windows))]
+            {
+                if let Some(cp) = control_path {
+                    cmd.push_str(&format!(
+                        " -o ControlPath={}",
+                        shell_quote(&cp.to_string_lossy())
+                    ));
+                } else {
+                    cmd.push_str(
+                        " -o ControlMaster=auto -o ControlPersist=4h -o ControlPath=/tmp/agy-sync-mux-%C",
+                    );
+                }
+            }
+            #[cfg(windows)]
+            {
+                let _ = control_path;
             }
         }
         cmd
@@ -179,9 +194,238 @@ pub fn check_ssh_auth(endpoint: &RemoteEndpoint) -> Result<bool> {
     }
 }
 
-/// Launches an interactive SSH `ControlMaster` bootstrap session (`-f -N -M -S <sock>`)
-/// inheriting the terminal so the user can enter their password/passphrase/OTP once,
-/// and all subsequent `ssh` and `rsync` commands reuse the authenticated socket.
+/// Returns `true` when `tar`-over-`ssh` streaming should be used instead of `rsync`
+/// (automatically enabled on native Windows when `rsync` is absent, when `rsync` is not in `PATH`,
+/// or when `AGY_SYNC_FORCE_TAR=1` is set).
+pub fn should_use_tar_transport() -> bool {
+    if std::env::var("AGY_SYNC_FORCE_TAR").ok().as_deref() == Some("1") {
+        return true;
+    }
+    static HAS_RSYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*HAS_RSYNC.get_or_init(|| {
+        Command::new("rsync")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Streams `rel_paths` from `local_base` to `remote_base` on `endpoint` using `tar -cf -`
+/// piped into `tar -xf -` (locally or over `ssh`).
+pub fn tar_push_paths(
+    endpoint: &RemoteEndpoint,
+    local_base: &Path,
+    remote_base: &str,
+    rel_paths: &[String],
+    excludes: &[String],
+    update_only: bool,
+    dry_run: bool,
+) -> Result<()> {
+    if dry_run || rel_paths.is_empty() {
+        return Ok(());
+    }
+    let existing_rels: Vec<&String> = rel_paths
+        .iter()
+        .filter(|r| *r == "." || local_base.join(r.as_str()).exists())
+        .collect();
+    if existing_rels.is_empty() {
+        return Ok(());
+    }
+
+    let mut tar_create = Command::new("tar");
+    tar_create.arg("-cf").arg("-");
+    for ex in excludes {
+        tar_create.arg(format!("--exclude={}", ex));
+    }
+    tar_create.arg("-C").arg(local_base);
+    for r in &existing_rels {
+        tar_create.arg(r.as_str());
+    }
+    tar_create.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut src_child = tar_create
+        .spawn()
+        .context("Failed to spawn local tar for push")?;
+    let src_stdout = src_child
+        .stdout
+        .take()
+        .context("Failed to capture local tar stdout")?;
+    let mut reader = BufReader::new(src_stdout);
+
+    if reader.fill_buf()?.is_empty() {
+        let _ = src_child.wait();
+        return Ok(());
+    }
+
+    match endpoint {
+        RemoteEndpoint::LocalRoot { .. } => {
+            fs::create_dir_all(remote_base)?;
+            let mut dst_cmd = Command::new("tar");
+            dst_cmd.arg("-xf").arg("-");
+            if update_only {
+                dst_cmd.arg("--keep-newer-files");
+            }
+            dst_cmd
+                .arg("-C")
+                .arg(remote_base)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut dst_child = dst_cmd
+                .spawn()
+                .context("Failed to spawn destination tar for LocalRoot push")?;
+            if let Some(mut dst_stdin) = dst_child.stdin.take() {
+                let _ = std::io::copy(&mut reader, &mut dst_stdin);
+            }
+            let _ = dst_child.wait();
+        }
+        RemoteEndpoint::Ssh { .. } => {
+            let target = endpoint.ssh_target().unwrap();
+            let keep_flag = if update_only {
+                "--keep-newer-files "
+            } else {
+                ""
+            };
+            let remote_script = format!(
+                "mkdir -p {rb} && (tar -xf - {kf}-C {rb} 2>/dev/null || true)",
+                rb = shell_quote(remote_base),
+                kf = keep_flag
+            );
+            let mut ssh_cmd = Command::new("ssh");
+            for arg in endpoint.ssh_args(true) {
+                ssh_cmd.arg(arg);
+            }
+            ssh_cmd
+                .arg(&target)
+                .arg(&remote_script)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit());
+            let mut dst_child = ssh_cmd
+                .spawn()
+                .with_context(|| format!("Failed to spawn ssh tar push to '{}'", target))?;
+            if let Some(mut dst_stdin) = dst_child.stdin.take() {
+                let _ = std::io::copy(&mut reader, &mut dst_stdin);
+            }
+            let status = dst_child.wait()?;
+            if !status.success() {
+                bail!("SSH tar push to '{}' failed (status {})", target, status);
+            }
+        }
+    }
+
+    let _ = src_child.wait();
+    Ok(())
+}
+
+/// Streams `rel_paths` from `remote_base` on `endpoint` into `local_base` using `tar -cf -`
+/// piped into local `tar -xf -`.
+pub fn tar_pull_paths(
+    endpoint: &RemoteEndpoint,
+    remote_base: &str,
+    local_base: &Path,
+    rel_paths: &[String],
+    excludes: &[String],
+    update_only: bool,
+    dry_run: bool,
+) -> Result<()> {
+    if dry_run || rel_paths.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(local_base)?;
+
+    let mut src_child = match endpoint {
+        RemoteEndpoint::LocalRoot { .. } => {
+            let r_path = Path::new(remote_base);
+            if !r_path.exists() {
+                return Ok(());
+            }
+            let existing_rels: Vec<&String> = rel_paths
+                .iter()
+                .filter(|r| *r == "." || r_path.join(r.as_str()).exists())
+                .collect();
+            if existing_rels.is_empty() {
+                return Ok(());
+            }
+            let mut cmd = Command::new("tar");
+            cmd.arg("-cf").arg("-");
+            for ex in excludes {
+                cmd.arg(format!("--exclude={}", ex));
+            }
+            cmd.arg("-C").arg(r_path);
+            for r in &existing_rels {
+                cmd.arg(r.as_str());
+            }
+            cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+            cmd.spawn()
+                .context("Failed to spawn source tar for LocalRoot pull")?
+        }
+        RemoteEndpoint::Ssh { .. } => {
+            let target = endpoint.ssh_target().unwrap();
+            let mut quoted_excludes = String::new();
+            for ex in excludes {
+                quoted_excludes.push_str(&format!(" --exclude={}", shell_quote(ex)));
+            }
+            let quoted_rels: Vec<String> = rel_paths.iter().map(|r| shell_quote(r)).collect();
+            let remote_script = format!(
+                "if [ -d {rb} ]; then cd {rb} && set -- && for p in {rels}; do if [ -e \"$p\" ]; then set -- \"$@\" \"$p\"; fi; done; if [ $# -gt 0 ]; then tar -cf -{ex} \"$@\"; fi; fi",
+                rb = shell_quote(remote_base),
+                rels = quoted_rels.join(" "),
+                ex = quoted_excludes
+            );
+            let mut ssh_cmd = Command::new("ssh");
+            for arg in endpoint.ssh_args(true) {
+                ssh_cmd.arg(arg);
+            }
+            ssh_cmd
+                .arg(&target)
+                .arg(&remote_script)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            ssh_cmd
+                .spawn()
+                .with_context(|| format!("Failed to spawn ssh tar pull from '{}'", target))?
+        }
+    };
+
+    let src_stdout = src_child
+        .stdout
+        .take()
+        .context("Failed to capture source tar stdout")?;
+    let mut reader = BufReader::new(src_stdout);
+
+    if reader.fill_buf()?.is_empty() {
+        let _ = src_child.wait();
+        return Ok(());
+    }
+
+    let mut dst_cmd = Command::new("tar");
+    dst_cmd.arg("-xf").arg("-");
+    if update_only {
+        dst_cmd.arg("--keep-newer-files");
+    }
+    dst_cmd
+        .arg("-C")
+        .arg(local_base)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut dst_child = dst_cmd
+        .spawn()
+        .context("Failed to spawn local tar for pull extraction")?;
+    if let Some(mut dst_stdin) = dst_child.stdin.take() {
+        let _ = std::io::copy(&mut reader, &mut dst_stdin);
+    }
+    let _ = dst_child.wait();
+    let _ = src_child.wait();
+    Ok(())
+}
+
+/// Launches an interactive SSH `ControlMaster` bootstrap session (`-f -N -M -S <sock>`) on Unix/macOS
+/// (or an interactive SSH verification on Windows where `ControlMaster` is unsupported by Win32-OpenSSH)
+/// inheriting the terminal so the user can enter their password/passphrase/OTP once.
 pub fn authenticate_ssh_interactive(
     endpoint: &mut RemoteEndpoint,
     user_override: Option<String>,
@@ -197,43 +441,74 @@ pub fn authenticate_ssh_interactive(
         *user = Some(u.trim().to_string());
     }
 
-    let pid = std::process::id();
-    let sock_path = PathBuf::from(format!("/tmp/agy-sync-ssh-{}.sock", pid));
-    if sock_path.exists() {
-        let _ = fs::remove_file(&sock_path);
-    }
-    *control_path = Some(sock_path.clone());
+    #[cfg(not(windows))]
+    {
+        let pid = std::process::id();
+        let sock_path = PathBuf::from(format!("/tmp/agy-sync-ssh-{}.sock", pid));
+        if sock_path.exists() {
+            let _ = fs::remove_file(&sock_path);
+        }
+        *control_path = Some(sock_path.clone());
 
-    let target = endpoint.ssh_target().unwrap();
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-f")
-        .arg("-N")
-        .arg("-M")
-        .arg("-S")
-        .arg(&sock_path)
-        .arg("-o")
-        .arg("ControlPersist=4h");
-    for arg in endpoint.ssh_args(false) {
-        cmd.arg(arg);
-    }
-    cmd.arg(&target);
-    cmd.stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        let target = endpoint.ssh_target().unwrap();
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-f")
+            .arg("-N")
+            .arg("-M")
+            .arg("-S")
+            .arg(&sock_path)
+            .arg("-o")
+            .arg("ControlPersist=4h");
+        for arg in endpoint.ssh_args(false) {
+            cmd.arg(arg);
+        }
+        cmd.arg(&target);
+        cmd.stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
 
-    let status = cmd.status().with_context(|| {
-        format!(
-            "Failed to start interactive SSH authentication to '{}'",
-            target
-        )
-    })?;
-    if !status.success() {
-        bail!(
-            "Interactive SSH authentication to '{}' failed (status {})",
-            target,
-            status
-        );
+        let status = cmd.status().with_context(|| {
+            format!(
+                "Failed to start interactive SSH authentication to '{}'",
+                target
+            )
+        })?;
+        if !status.success() {
+            bail!(
+                "Interactive SSH authentication to '{}' failed (status {})",
+                target,
+                status
+            );
+        }
     }
+
+    #[cfg(windows)]
+    {
+        let _ = control_path;
+        let target = endpoint.ssh_target().unwrap();
+        let mut cmd = Command::new("ssh");
+        for arg in endpoint.ssh_args(false) {
+            cmd.arg(arg);
+        }
+        cmd.arg(&target).arg("printf 'OK'");
+        cmd.stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        let status = cmd.status().with_context(|| {
+            format!(
+                "Failed to start interactive SSH authentication to '{}'",
+                target
+            )
+        })?;
+        if !status.success() {
+            bail!(
+                "Interactive SSH authentication to '{}' failed (status {})",
+                target,
+                status
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -290,13 +565,19 @@ pub fn probe_remote(
         }
     };
 
-    let local_proj_str = local_project_path.to_string_lossy();
-    let local_home_trimmed = local_home.trim_end_matches('/');
+    let local_proj_norm =
+        crate::config::normalize_home_path_string(&local_project_path.to_string_lossy());
+    let local_home_norm = crate::config::normalize_home_path_string(local_home);
 
-    let remote_project_path = if let Some(rel) = local_proj_str.strip_prefix(local_home_trimmed) {
+    let remote_project_path = if !local_home_norm.is_empty()
+        && local_proj_norm.len() >= local_home_norm.len()
+        && local_proj_norm[..local_home_norm.len()].eq_ignore_ascii_case(&local_home_norm)
+    {
+        format!("{}{}", remote_home, &local_proj_norm[local_home_norm.len()..])
+    } else if let Some((_, _, rel)) = crate::discovery::split_home_and_relative(&local_proj_norm) {
         format!("{}{}", remote_home, rel)
     } else {
-        local_proj_str.to_string()
+        local_proj_norm
     };
 
     let remote_gemini_root = format!("{}/.gemini", remote_home);
@@ -392,28 +673,44 @@ pub fn stage_remote_gemini_metadata(
             }
         }
         RemoteEndpoint::Ssh { .. } => {
-            let target = probe.endpoint.ssh_target().unwrap();
-            let transport_cmd = probe.endpoint.rsync_ssh_transport_cmd();
-            let r_proj_spec = format!("{}:{}/projects.json", target, probe.remote_gemini_root);
-            let _ = Command::new("rsync")
-                .arg("-az")
-                .arg("-e")
-                .arg(&transport_cmd)
-                .arg(&r_proj_spec)
-                .arg(staging_gemini_root.join("projects.json"))
-                .output();
+            if should_use_tar_transport() {
+                let _ = tar_pull_paths(
+                    &probe.endpoint,
+                    &probe.remote_gemini_root,
+                    staging_gemini_root,
+                    &[
+                        "projects.json".to_string(),
+                        "config/projects".to_string(),
+                    ],
+                    &[],
+                    false,
+                    false,
+                );
+            } else {
+                let target = probe.endpoint.ssh_target().unwrap();
+                let transport_cmd = probe.endpoint.rsync_ssh_transport_cmd();
+                let r_proj_spec = format!("{}:{}/projects.json", target, probe.remote_gemini_root);
+                let _ = Command::new("rsync")
+                    .arg("-az")
+                    .arg("-e")
+                    .arg(&transport_cmd)
+                    .arg(&r_proj_spec)
+                    .arg(staging_gemini_root.join("projects.json"))
+                    .output();
 
-            let r_cfg_spec = format!("{}:{}/config/projects/", target, probe.remote_gemini_root);
-            let _ = Command::new("rsync")
-                .arg("-az")
-                .arg("-e")
-                .arg(&transport_cmd)
-                .arg(&r_cfg_spec)
-                .arg(format!(
-                    "{}/",
-                    staging_gemini_root.join("config/projects").display()
-                ))
-                .output();
+                let r_cfg_spec =
+                    format!("{}:{}/config/projects/", target, probe.remote_gemini_root);
+                let _ = Command::new("rsync")
+                    .arg("-az")
+                    .arg("-e")
+                    .arg(&transport_cmd)
+                    .arg(&r_cfg_spec)
+                    .arg(format!(
+                        "{}/",
+                        staging_gemini_root.join("config/projects").display()
+                    ))
+                    .output();
+            }
         }
     }
     Ok(())
@@ -538,15 +835,27 @@ pub fn stage_remote_harness_index(
             ];
             files_to_pull.extend(pb_files);
 
-            for fname in files_to_pull {
-                let remote_spec = format!("{}:{}/{}", target, remote_dir_str, fname);
-                let mut cmd = Command::new("rsync");
-                cmd.arg("-az")
-                    .arg("-e")
-                    .arg(&transport_cmd)
-                    .arg(&remote_spec)
-                    .arg(staging_harness_dir.join(&fname));
-                let _ = cmd.output();
+            if should_use_tar_transport() {
+                let _ = tar_pull_paths(
+                    &probe.endpoint,
+                    &remote_dir_str,
+                    staging_harness_dir,
+                    &files_to_pull,
+                    &[],
+                    false,
+                    false,
+                );
+            } else {
+                for fname in files_to_pull {
+                    let remote_spec = format!("{}:{}/{}", target, remote_dir_str, fname);
+                    let mut cmd = Command::new("rsync");
+                    cmd.arg("-az")
+                        .arg("-e")
+                        .arg(&transport_cmd)
+                        .arg(&remote_spec)
+                        .arg(staging_harness_dir.join(&fname));
+                    let _ = cmd.output();
+                }
             }
         }
     }
@@ -666,23 +975,44 @@ pub fn push_staged_remote_harness_index(
             );
             run_remote_script(&probe.endpoint, &backup_script)?;
 
-            for src in staged_files {
-                if src.exists() {
-                    if let Some(fname) = src.file_name().and_then(|n| n.to_str()) {
-                        let remote_spec = format!("{}:{}/{}", target, remote_dir_str, fname);
-                        let mut cmd = Command::new("rsync");
-                        cmd.arg("-az")
-                            .arg("-e")
-                            .arg(&transport_cmd)
-                            .arg(&src)
-                            .arg(&remote_spec);
-                        let out = cmd.output().context("Failed to run rsync for remote index")?;
-                        if !out.status.success() {
-                            bail!(
-                                "Failed to push {} to remote: {}",
-                                fname,
-                                String::from_utf8_lossy(&out.stderr).trim()
-                            );
+            if should_use_tar_transport() {
+                let mut rel_names = Vec::new();
+                for src in &staged_files {
+                    if src.exists() {
+                        if let Some(fname) = src.file_name().and_then(|n| n.to_str()) {
+                            rel_names.push(fname.to_string());
+                        }
+                    }
+                }
+                tar_push_paths(
+                    &probe.endpoint,
+                    staging_harness_dir,
+                    &remote_dir_str,
+                    &rel_names,
+                    &[],
+                    false,
+                    false,
+                )?;
+            } else {
+                for src in staged_files {
+                    if src.exists() {
+                        if let Some(fname) = src.file_name().and_then(|n| n.to_str()) {
+                            let remote_spec = format!("{}:{}/{}", target, remote_dir_str, fname);
+                            let mut cmd = Command::new("rsync");
+                            cmd.arg("-az")
+                                .arg("-e")
+                                .arg(&transport_cmd)
+                                .arg(&src)
+                                .arg(&remote_spec);
+                            let out =
+                                cmd.output().context("Failed to run rsync for remote index")?;
+                            if !out.status.success() {
+                                bail!(
+                                    "Failed to push {} to remote: {}",
+                                    fname,
+                                    String::from_utf8_lossy(&out.stderr).trim()
+                                );
+                            }
                         }
                     }
                 }
@@ -730,6 +1060,32 @@ pub fn rsync_workspace_dir(
         } else {
             fs::create_dir_all(local_dir)?;
         }
+    }
+
+    if should_use_tar_transport() {
+        let dot = vec![".".to_string()];
+        if push {
+            tar_push_paths(
+                &probe.endpoint,
+                local_dir,
+                &probe.remote_project_path,
+                &dot,
+                &opts.excludes,
+                opts.update_only,
+                opts.dry_run,
+            )?;
+        } else {
+            tar_pull_paths(
+                &probe.endpoint,
+                &probe.remote_project_path,
+                local_dir,
+                &dot,
+                &opts.excludes,
+                opts.update_only,
+                opts.dry_run,
+            )?;
+        }
+        return Ok(String::new());
     }
 
     let local_slash = format!("{}/", local_dir.to_string_lossy().trim_end_matches('/'));
@@ -857,6 +1213,33 @@ pub fn rsync_harness_relative_paths(
     ensure_sufficient_fd_limit();
 
     let remote_dir_str = probe.remote_harness_dir(harness_subdir);
+    if should_use_tar_transport() {
+        for chunk in relative_paths.chunks(RSYNC_FILES_FROM_BATCH_SIZE) {
+            if push {
+                tar_push_paths(
+                    &probe.endpoint,
+                    local_root_dir,
+                    &remote_dir_str,
+                    chunk,
+                    &[],
+                    update_only,
+                    dry_run,
+                )?;
+            } else {
+                tar_pull_paths(
+                    &probe.endpoint,
+                    &remote_dir_str,
+                    local_root_dir,
+                    chunk,
+                    &[],
+                    update_only,
+                    dry_run,
+                )?;
+            }
+        }
+        return Ok(String::new());
+    }
+
     let local_slash = format!("{}/", local_root_dir.to_string_lossy().trim_end_matches('/'));
     let remote_slash = match &probe.endpoint {
         RemoteEndpoint::LocalRoot { .. } => {
@@ -914,4 +1297,80 @@ pub fn rsync_harness_relative_paths(
         }
     }
     Ok(String::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_tar_push_and_pull_fallback_local_root() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let local_dir = tmp.path().join("local_ws");
+        let remote_dir = tmp.path().join("remote_ws");
+        let pulled_dir = tmp.path().join("pulled_ws");
+        fs::create_dir_all(local_dir.join("src"))?;
+        fs::write(local_dir.join("src/main.rs"), b"fn main() {}")?;
+        fs::write(local_dir.join("ignored.tmp"), b"ignore-me")?;
+
+        let ep = RemoteEndpoint::LocalRoot {
+            root_home: tmp.path().to_path_buf(),
+        };
+        let remote_str = remote_dir.to_string_lossy().to_string();
+
+        tar_push_paths(
+            &ep,
+            &local_dir,
+            &remote_str,
+            &[".".to_string()],
+            &["ignored.tmp".to_string()],
+            false,
+            false,
+        )?;
+        assert!(remote_dir.join("src/main.rs").exists());
+        assert!(!remote_dir.join("ignored.tmp").exists());
+
+        tar_pull_paths(
+            &ep,
+            &remote_str,
+            &pulled_dir,
+            &["src/main.rs".to_string()],
+            &[],
+            false,
+            false,
+        )?;
+        assert_eq!(
+            fs::read_to_string(pulled_dir.join("src/main.rs"))?,
+            "fn main() {}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_probe_remote_windows_and_chromeos_paths() -> Result<()> {
+        let ep = RemoteEndpoint::LocalRoot {
+            root_home: PathBuf::from("/home/devuser"),
+        };
+        let win_probe = probe_remote(
+            &ep,
+            r"C:\Users\devuser",
+            Path::new(r"C:\Users\devuser\Documents\my-repo"),
+        )?;
+        assert_eq!(
+            win_probe.remote_project_path,
+            "/home/devuser/Documents/my-repo"
+        );
+
+        let chromeos_probe = probe_remote(
+            &ep,
+            "/home/devuser",
+            Path::new("/mnt/chromeos/MyFiles/Documents/my-repo"),
+        )?;
+        assert_eq!(
+            chromeos_probe.remote_project_path,
+            "/home/devuser/Documents/my-repo"
+        );
+        Ok(())
+    }
 }

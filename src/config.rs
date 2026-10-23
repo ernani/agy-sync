@@ -17,6 +17,57 @@ pub struct AgySyncConfig {
     pub default_harnesses: Vec<String>,
 }
 
+/// Normalizes a filesystem path string by stripping Windows `\\?\` verbatim prefixes,
+/// converting backslashes (`\`) to forward slashes (`/`), and trimming trailing slashes
+/// (unless it is the root `/`).
+pub fn normalize_home_path_string(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let stripped = trimmed
+        .strip_prefix(r"\\?\UNC\")
+        .map(|s| format!("//{}", s))
+        .unwrap_or_else(|| {
+            trimmed
+                .strip_prefix(r"\\?\")
+                .or_else(|| trimmed.strip_prefix("//?/"))
+                .unwrap_or(trimmed)
+                .to_string()
+        });
+    let forward = stripped.replace('\\', "/");
+    let no_trail = forward.trim_end_matches('/');
+    if no_trail.is_empty() && forward.starts_with('/') {
+        "/".to_string()
+    } else {
+        no_trail.to_string()
+    }
+}
+
+/// Resolves the local user's `$HOME` directory across `*nix` (macOS/Linux), WSL2, ChromeOS (`crosh`/Crostini),
+/// and native Windows (`USERPROFILE` / `HOMEDRIVE` + `HOMEPATH`), normalized with forward slashes.
+pub fn resolve_local_home() -> Result<String> {
+    if let Ok(h) = std::env::var("HOME") {
+        let norm = normalize_home_path_string(&h);
+        if !norm.is_empty() {
+            return Ok(norm);
+        }
+    }
+    if let Ok(up) = std::env::var("USERPROFILE") {
+        let norm = normalize_home_path_string(&up);
+        if !norm.is_empty() {
+            return Ok(norm);
+        }
+    }
+    if let (Ok(drive), Ok(path)) = (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH")) {
+        let combined = format!("{}{}", drive.trim(), path.trim());
+        let norm = normalize_home_path_string(&combined);
+        if !norm.is_empty() {
+            return Ok(norm);
+        }
+    }
+    anyhow::bail!(
+        "Unable to determine user home directory: neither HOME nor USERPROFILE environment variable is set"
+    )
+}
+
 /// Returns `$HOME/.config/.agy-sync`.
 pub fn config_file_path(home: &str) -> PathBuf {
     Path::new(home).join(".config").join(".agy-sync")

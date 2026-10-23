@@ -1,4 +1,6 @@
-use agy_sync::config::{config_file_path, detect_port_in_ssh_config, AgySyncConfig};
+use agy_sync::config::{
+    config_file_path, detect_port_in_ssh_config, resolve_local_home, AgySyncConfig,
+};
 use agy_sync::discovery::{is_home_or_root_path, normalize_project_path};
 use agy_sync::engine::{print_report, run_engine, EngineConfig, SyncMode};
 use agy_sync::harnesses::{discover_harnesses, HarnessKind};
@@ -279,7 +281,7 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let local_home = env::var("HOME").context("HOME environment variable is not set")?;
+    let local_home = resolve_local_home()?;
 
     if let Some(Commands::Config {
         show,
