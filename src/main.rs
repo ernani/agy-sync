@@ -1,12 +1,16 @@
 use agy_sync::config::{config_file_path, detect_port_in_ssh_config, AgySyncConfig};
-use agy_sync::discovery::normalize_project_path;
+use agy_sync::discovery::{is_home_or_root_path, normalize_project_path};
 use agy_sync::engine::{print_report, run_engine, EngineConfig, SyncMode};
 use agy_sync::harnesses::{discover_harnesses, HarnessKind};
 use agy_sync::interactive::run_interactive_wizard;
-use agy_sync::transport::{ensure_sufficient_fd_limit, RemoteEndpoint};
+use agy_sync::transport::{
+    ensure_sufficient_fd_limit, probe_remote, run_remote_script, shell_quote, RemoteEndpoint,
+};
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use std::collections::BTreeSet;
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
@@ -186,6 +190,83 @@ fn resolve_harnesses(
     }
 }
 
+/// Checks whether `project_path` is a multi-project container directory (has no `.git` or project manifest
+/// at its own root, is not `$HOME`, and contains child project directories with `.git`).
+/// If so, returns the sorted union of child project names across Local and (if probed) Remote.
+fn detect_container_child_projects(
+    project_path: &Path,
+    local_home: &str,
+    endpoint: Option<&RemoteEndpoint>,
+) -> Result<Option<Vec<String>>> {
+    let norm = normalize_project_path(project_path);
+    if is_home_or_root_path(&norm, local_home) {
+        return Ok(None);
+    }
+    for root_marker in [
+        ".git",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+    ] {
+        if norm.join(root_marker).exists() {
+            return Ok(None);
+        }
+    }
+
+    let mut child_names = BTreeSet::new();
+    let mut git_children = 0usize;
+    if let Ok(entries) = fs::read_dir(&norm) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            child_names.insert(name.to_string());
+            if p.join(".git").exists()
+                || p.join("Cargo.toml").exists()
+                || p.join("package.json").exists()
+                || p.join("pyproject.toml").exists()
+            {
+                git_children += 1;
+            }
+        }
+    }
+
+    if git_children == 0 || child_names.len() < 2 {
+        return Ok(None);
+    }
+
+    if let Some(ep) = endpoint {
+        if let Ok(probe) = probe_remote(ep, local_home, &norm) {
+            let script = format!(
+                "if [ -d {rp} ]; then \
+                   for d in {rp}/*; do \
+                     if [ -d \"$d\" ]; then basename \"$d\"; fi; \
+                   done; \
+                 fi",
+                rp = shell_quote(&probe.remote_project_path)
+            );
+            if let Ok(out) = run_remote_script(ep, &script) {
+                for line in out.lines() {
+                    let name = line.trim();
+                    if !name.is_empty() && !name.starts_with('.') && name != "*" {
+                        child_names.insert(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Some(child_names.into_iter().collect()))
+}
+
 fn main() -> Result<()> {
     ensure_sufficient_fd_limit();
 
@@ -282,19 +363,6 @@ fn main() -> Result<()> {
         return run_interactive_wizard(base_config, cli.remote);
     }
 
-    if mode != SyncMode::Inspect {
-        use std::io::Write;
-        println!(
-            "==> [agy-sync] Scanning local harnesses for workspace: {}",
-            project_path.display()
-        );
-        let _ = std::io::stdout().flush();
-    }
-
-    let local_gemini_root = base_config.local_gemini_root();
-    base_config.selected_harnesses =
-        resolve_harnesses(&cli.harness, &project_path, &local_gemini_root)?;
-
     let endpoint = match cli.command.unwrap_or(Commands::Sync) {
         Commands::Inspect { probe_remote } => {
             if probe_remote {
@@ -317,6 +385,50 @@ fn main() -> Result<()> {
         Commands::Config { .. } => unreachable!(),
     };
     base_config.endpoint = endpoint;
+
+    let local_gemini_root = base_config.local_gemini_root();
+
+    if let Some(children) = detect_container_child_projects(
+        &project_path,
+        &local_home,
+        base_config.endpoint.as_ref(),
+    )? {
+        let norm_container = normalize_project_path(&project_path);
+        println!(
+            "==> [agy-sync] Multi-project container detected at {} ({} projects)",
+            norm_container.display(),
+            children.len()
+        );
+        for (idx, child_name) in children.iter().enumerate() {
+            let child_path = norm_container.join(child_name);
+            println!(
+                "\n>>> [{}/{}] Project: {} ({})",
+                idx + 1,
+                children.len(),
+                child_name,
+                child_path.display()
+            );
+            let mut child_cfg = base_config.clone();
+            child_cfg.project_path = child_path.clone();
+            child_cfg.selected_harnesses =
+                resolve_harnesses(&cli.harness, &child_path, &local_gemini_root)?;
+            let report = run_engine(&child_cfg)?;
+            print_report(&report, &child_cfg);
+        }
+        return Ok(());
+    }
+
+    if mode != SyncMode::Inspect {
+        use std::io::Write;
+        println!(
+            "==> [agy-sync] Scanning local harnesses for workspace: {}",
+            project_path.display()
+        );
+        let _ = std::io::stdout().flush();
+    }
+
+    base_config.selected_harnesses =
+        resolve_harnesses(&cli.harness, &project_path, &local_gemini_root)?;
 
     let report = run_engine(&base_config)?;
     print_report(&report, &base_config);
