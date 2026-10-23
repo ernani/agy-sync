@@ -170,10 +170,10 @@ fn build_workspace_excludes(config: &EngineConfig) -> Vec<String> {
     let mut excludes = vec![".DS_Store".to_string(), ".git/index.lock".to_string()];
     if !config.include_build_dirs {
         excludes.extend([
-            "target/".to_string(),
-            "node_modules/".to_string(),
-            ".venv/".to_string(),
-            "__pycache__/".to_string(),
+            "target".to_string(),
+            "node_modules".to_string(),
+            ".venv".to_string(),
+            "__pycache__".to_string(),
         ]);
     }
     excludes.extend(config.extra_excludes.iter().cloned());

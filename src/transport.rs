@@ -103,7 +103,7 @@ impl RemoteEndpoint {
                 args.push("-o".to_string());
                 args.push("ControlMaster=auto".to_string());
                 args.push("-o".to_string());
-                args.push("ControlPersist=60".to_string());
+                args.push("ControlPersist=4h".to_string());
                 args.push("-o".to_string());
                 args.push("ControlPath=/tmp/agy-sync-mux-%C".to_string());
             }
@@ -128,7 +128,7 @@ impl RemoteEndpoint {
                 ));
             } else {
                 cmd.push_str(
-                    " -o ControlMaster=auto -o ControlPersist=60 -o ControlPath=/tmp/agy-sync-mux-%C",
+                    " -o ControlMaster=auto -o ControlPersist=4h -o ControlPath=/tmp/agy-sync-mux-%C",
                 );
             }
         }
@@ -255,9 +255,24 @@ pub fn probe_remote(
                 cmd.arg(arg);
             }
             cmd.arg(&target).arg("printf '%s' \"$HOME\"");
-            let output = cmd
+            let mut output = cmd
                 .output()
                 .with_context(|| format!("Failed to execute ssh to host '{}'", target))?;
+            if !output.status.success() {
+                // Retry without BatchMode=yes (inheriting stderr/stdin) in case a FIDO2 hardware key touch is required
+                let mut retry_cmd = Command::new("ssh");
+                for arg in endpoint.ssh_args(false) {
+                    retry_cmd.arg(arg);
+                }
+                retry_cmd
+                    .arg(&target)
+                    .arg("printf '%s' \"$HOME\"")
+                    .stdin(Stdio::inherit())
+                    .stderr(Stdio::inherit());
+                output = retry_cmd
+                    .output()
+                    .with_context(|| format!("Failed to execute ssh to host '{}'", target))?;
+            }
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 bail!(

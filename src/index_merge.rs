@@ -473,30 +473,96 @@ pub fn merge_project_manifest(
     Ok(stats)
 }
 
-/// Returns all conversation IDs in `harness_dir/conversation_summaries.db`
-/// whose `workspace_uris` or `preview` contains `foreign_home`.
+/// Returns all conversation IDs in `harness_dir` whose global summary row (`conversation_summaries.db`),
+/// per-conversation SQLite metadata (`conversations/<id>.db` -> `trajectory_metadata_blob`),
+/// or implicit protobuf (`implicit/<id>.pb`) contains `foreign_home`.
 pub fn find_sessions_with_home_prefix(harness_dir: &Path, foreign_home: &str) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     let trimmed = foreign_home.trim_end_matches('/');
     if trimmed.is_empty() {
         return found;
     }
+    let needle = trimmed.as_bytes();
+
+    // 1. Check global conversation_summaries.db
     let db_path = harness_dir.join("conversation_summaries.db");
     if db_path.exists() {
         if let Ok(conn) = Connection::open(&db_path) {
             let _ = conn.busy_timeout(std::time::Duration::from_millis(2000));
             let pattern = format!("%{}%", trimmed);
             if let Ok(mut stmt) = conn.prepare(
-                "SELECT conversation_id FROM conversation_summaries WHERE workspace_uris LIKE ?1 OR preview LIKE ?1",
+                "SELECT conversation_id, raw_summary FROM conversation_summaries WHERE workspace_uris LIKE ?1 OR preview LIKE ?1",
             ) {
-                if let Ok(rows) = stmt.query_map([&pattern], |r| r.get::<_, String>(0)) {
-                    for cid in rows.flatten() {
+                if let Ok(rows) = stmt.query_map([&pattern], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default(),
+                    ))
+                }) {
+                    for (cid, _) in rows.flatten() {
                         found.insert(cid);
                     }
                 }
             }
         }
     }
+
+    // 2. Check per-conversation conversations/*.db trajectory_metadata_blob
+    let conv_dir = harness_dir.join("conversations");
+    if let Ok(entries) = fs::read_dir(&conv_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("db") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if found.contains(stem) {
+                continue;
+            }
+            if let Ok(conn) = Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ) {
+                let _ = conn.busy_timeout(std::time::Duration::from_millis(500));
+                if let Ok(mut stmt) = conn.prepare("SELECT data FROM trajectory_metadata_blob") {
+                    if let Ok(rows) = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0)) {
+                        for blob in rows.flatten() {
+                            if blob.windows(needle.len()).any(|w| w == needle) {
+                                found.insert(stem.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Check implicit/*.pb
+    let imp_dir = harness_dir.join("implicit");
+    if let Ok(entries) = fs::read_dir(&imp_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("pb") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if found.contains(stem) {
+                continue;
+            }
+            if let Ok(bytes) = fs::read(&path) {
+                if bytes.windows(needle.len()).any(|w| w == needle) {
+                    found.insert(stem.to_string());
+                }
+            }
+        }
+    }
+
     found
 }
 
