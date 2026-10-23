@@ -436,6 +436,77 @@ fn discover_gemini_cli_legacy(
     })
 }
 
+/// Deterministically generates a valid RFC-4122 v4 UUID string based on the input seed string.
+pub fn generate_project_uuid(seed_str: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut h1 = DefaultHasher::new();
+    seed_str.hash(&mut h1);
+    let u1 = h1.finish();
+
+    let mut h2 = DefaultHasher::new();
+    (seed_str, u1).hash(&mut h2);
+    let u2 = h2.finish();
+
+    let mut b1 = u1.to_be_bytes();
+    let mut b2 = u2.to_be_bytes();
+
+    // Set UUID version to 4 (0100)
+    b1[6] = (b1[6] & 0x0f) | 0x40;
+    // Set UUID variant to RFC 4122 (10xx)
+    b2[0] = (b2[0] & 0x3f) | 0x80;
+
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b1[0], b1[1], b1[2], b1[3],
+        b1[4], b1[5],
+        b1[6], b1[7],
+        b2[0], b2[1],
+        b2[2], b2[3], b2[4], b2[5], b2[6], b2[7]
+    )
+}
+
+/// Ensures a `config/projects/<id>.json` workspace manifest exists for `project_path`.
+/// If an existing manifest matches `project_path`'s URI, returns its ID.
+/// Otherwise, generates a deterministic UUID and creates the manifest.
+pub fn ensure_workspace_project_manifest(
+    gemini_root: &Path,
+    project_path: &Path,
+    project_name: &str,
+) -> Result<String> {
+    let norm_path = crate::config::normalize_home_path_string(&project_path.to_string_lossy());
+    let project_uri = format!("file://{}", norm_path);
+
+    let matched = crate::discovery::find_matching_config_project_ids(gemini_root, &project_uri);
+    if let Some(existing_id) = matched.into_iter().next() {
+        return Ok(existing_id);
+    }
+
+    let new_id = generate_project_uuid(&project_uri);
+    let projects_dir = gemini_root.join("config").join("projects");
+    fs::create_dir_all(&projects_dir)?;
+    let manifest_path = projects_dir.join(format!("{}.json", new_id));
+
+    let manifest_val = serde_json::json!({
+        "id": new_id,
+        "name": project_name,
+        "projectResources": {
+            "resources": [
+                {
+                    "folderUri": project_uri
+                }
+            ]
+        },
+        "settings": {},
+        "isWorkspaceOnly": false
+    });
+
+    let formatted = serde_json::to_string_pretty(&manifest_val)? + "\n";
+    fs::write(&manifest_path, formatted)?;
+    Ok(new_id)
+}
+
 /// Synchronizes `config/projects/<id>.json` files between two `~/.gemini` roots,
 /// rewriting `from_home` -> `to_home` in `folderUri`.
 pub fn sync_config_project_files(
@@ -579,7 +650,24 @@ mod tests {
             .unwrap();
         assert!(legacy.has_interactions);
         assert_eq!(legacy.legacy_project_slug.as_deref(), Some("demo-app"));
+        Ok(())
+    }
 
+    #[test]
+    fn test_ensure_workspace_project_manifest() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let gemini_root = tmp.path().join(".gemini");
+        let proj_dir = tmp.path().join("code/test-app");
+        fs::create_dir_all(&proj_dir)?;
+
+        let id1 = ensure_workspace_project_manifest(&gemini_root, &proj_dir, "test-app")?;
+        assert_eq!(id1.len(), 36);
+        let cfg_path = gemini_root.join(format!("config/projects/{}.json", id1));
+        assert!(cfg_path.exists());
+
+        // Calling it again on the same path returns the same ID without duplicate
+        let id2 = ensure_workspace_project_manifest(&gemini_root, &proj_dir, "test-app")?;
+        assert_eq!(id1, id2);
         Ok(())
     }
 }
