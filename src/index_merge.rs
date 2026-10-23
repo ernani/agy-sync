@@ -473,6 +473,33 @@ pub fn merge_project_manifest(
     Ok(stats)
 }
 
+/// Returns all conversation IDs in `harness_dir/conversation_summaries.db`
+/// whose `workspace_uris` or `preview` contains `foreign_home`.
+pub fn find_sessions_with_home_prefix(harness_dir: &Path, foreign_home: &str) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    let trimmed = foreign_home.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return found;
+    }
+    let db_path = harness_dir.join("conversation_summaries.db");
+    if db_path.exists() {
+        if let Ok(conn) = Connection::open(&db_path) {
+            let _ = conn.busy_timeout(std::time::Duration::from_millis(2000));
+            let pattern = format!("%{}%", trimmed);
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT conversation_id FROM conversation_summaries WHERE workspace_uris LIKE ?1 OR preview LIKE ?1",
+            ) {
+                if let Ok(rows) = stmt.query_map([&pattern], |r| r.get::<_, String>(0)) {
+                    for cid in rows.flatten() {
+                        found.insert(cid);
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Remaps `$HOME` paths (`from_home` -> `to_home`) inside per-conversation artifacts on disk:
 /// - `conversations/<id>.db` -> `trajectory_metadata_blob` (and `steps` if `deep_remap` is enabled)
 /// - `implicit/<id>.pb` -> length-prefixed Protobuf string rewriting

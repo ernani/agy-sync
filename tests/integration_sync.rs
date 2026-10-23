@@ -320,6 +320,27 @@ fn test_bidirectional_sync_mac_and_remote_end_to_end() {
         )
         .unwrap();
     assert_eq!(other_rt_count, 1);
+
+    // 5. Run a second consecutive sync (InSyncDeltaCheck) and verify per-conversation DB blobs
+    //    do NOT ping-pong or clobber local $HOME URIs with remote $HOME URIs!
+    let report2 = run_engine(&config).unwrap();
+    assert_eq!(
+        report2.session_actions.get(s1),
+        Some(&SessionAction::InSyncDeltaCheck)
+    );
+    assert_eq!(
+        read_trajectory_metadata_blob(&mac_agy.join(format!("conversations/{}.db", s1))),
+        create_proto_blob_with_uri(&mac_proj_uri)
+    );
+    assert_eq!(
+        read_trajectory_metadata_blob(&remote_agy.join(format!("conversations/{}.db", s1))),
+        create_proto_blob_with_uri(&remote_proj_uri)
+    );
+
+    // 6. Verify running sync directly on $HOME is rejected with an error
+    let mut bad_home_cfg = config.clone();
+    bad_home_cfg.project_path = Path::new(&mac_home).to_path_buf();
+    assert!(run_engine(&bad_home_cfg).is_err());
 }
 
 #[test]

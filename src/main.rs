@@ -3,7 +3,7 @@ use agy_sync::discovery::normalize_project_path;
 use agy_sync::engine::{print_report, run_engine, EngineConfig, SyncMode};
 use agy_sync::harnesses::{discover_harnesses, HarnessKind};
 use agy_sync::interactive::run_interactive_wizard;
-use agy_sync::transport::RemoteEndpoint;
+use agy_sync::transport::{ensure_sufficient_fd_limit, RemoteEndpoint};
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use std::env;
@@ -187,6 +187,8 @@ fn resolve_harnesses(
 }
 
 fn main() -> Result<()> {
+    ensure_sufficient_fd_limit();
+
     if env::args_os().len() <= 1 {
         let mut cmd = Cli::command();
         cmd.print_help()?;

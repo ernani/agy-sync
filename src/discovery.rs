@@ -61,12 +61,100 @@ pub fn normalize_project_path(path: &Path) -> PathBuf {
     PathBuf::from(if s.is_empty() { "/" } else { &s })
 }
 
+/// Extracts `(home_dir, username, relative_path)` from a filesystem path or `file://` URI
+/// for standard Unix/macOS home directories (`/Users/<user>[/...]` or `[/usr/...]/home/<user>[/...]`).
+pub fn split_home_and_relative(raw: &str) -> Option<(&str, &str, &str)> {
+    let path = raw
+        .strip_prefix("file://")
+        .unwrap_or(raw)
+        .trim_end_matches('/');
+    if let Some(after_users) = path.strip_prefix("/Users/") {
+        if after_users.is_empty() {
+            return None;
+        }
+        return match after_users.find('/') {
+            Some(idx) => {
+                let user = &after_users[..idx];
+                let home = &path[..7 + idx];
+                let rel = &after_users[idx..];
+                Some((home, user, rel))
+            }
+            None => Some((path, after_users, "")),
+        };
+    }
+    if path.starts_with("/home/") || path.starts_with("/usr/") {
+        if let Some(pos) = path.find("/home/") {
+            let after_home = &path[pos + 6..];
+            if after_home.is_empty() {
+                return None;
+            }
+            return match after_home.find('/') {
+                Some(idx) => {
+                    let user = &after_home[..idx];
+                    let home = &path[..pos + 6 + idx];
+                    let rel = &after_home[idx..];
+                    Some((home, user, rel))
+                }
+                None => Some((path, after_home, "")),
+            };
+        }
+    }
+    None
+}
+
+/// Returns true if `path` is a user `$HOME` directory root (or filesystem root `/`).
+pub fn is_home_or_root_path(path: &Path, local_home: &str) -> bool {
+    let norm = normalize_project_path(path);
+    let s = norm.to_string_lossy();
+    let trimmed = s.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "/" || trimmed == "/Users" || trimmed == "/home" {
+        return true;
+    }
+    if !local_home.is_empty() && trimmed == local_home.trim_end_matches('/') {
+        return true;
+    }
+    if let Some((_, _, rel)) = split_home_and_relative(trimmed) {
+        if rel.is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Check if a workspace URI string matches the target `project_uri` (exact match or sub-directory).
+///
+/// Special cases:
+/// 1. If `project_uri` is a user's `$HOME` root (`rel == ""`), only an exact match is allowed
+///    so running in `$HOME` never sweeps up child projects under `~/Documents/...`.
+/// 2. If `uri` and `project_uri` belong to the same username (`user_u == user_p`) under different
+///    OS `$HOME` mount points (e.g. macOS `/Users/<user>/...` vs Linux `[.../]/home/<user>/...`),
+///    their relative project paths are compared so unremapped sessions are still discovered.
 pub fn uri_matches_project(uri: &str, project_uri: &str) -> bool {
     let u = uri.trim_end_matches('/');
     let p = project_uri.trim_end_matches('/');
+
+    if let (Some((_, user_u, rel_u)), Some((_, user_p, rel_p))) =
+        (split_home_and_relative(u), split_home_and_relative(p))
+    {
+        if rel_p.is_empty() {
+            return user_u == user_p && rel_u.is_empty();
+        }
+        if user_u == user_p {
+            if rel_u == rel_p {
+                return true;
+            }
+            if let Some(rest) = rel_u.strip_prefix(rel_p) {
+                return rest.starts_with('/');
+            }
+            return false;
+        }
+    }
+
     if u == p {
         return true;
+    }
+    if p == "file://" || p == "file:///" || p == "/" {
+        return false;
     }
     if let Some(rest) = u.strip_prefix(p) {
         return rest.starts_with('/');
@@ -553,14 +641,19 @@ pub fn discover_project_sessions(
     }
 
     // 5. Scan orphan brain/<uuid> directories that weren't in SQLite DB
+    let is_home_root = is_home_or_root_path(&norm_project, "");
     let mut known_ids: BTreeSet<String> = all_db_rows.keys().cloned().collect();
     known_ids.extend(matched_ids.iter().cloned());
-    let orphan_ids = scan_orphan_brains(
-        &harness_dir.join("brain"),
-        &known_ids,
-        &project_path_str,
-        &project_uri,
-    );
+    let orphan_ids = if is_home_root {
+        BTreeSet::new()
+    } else {
+        scan_orphan_brains(
+            &harness_dir.join("brain"),
+            &known_ids,
+            &project_path_str,
+            &project_uri,
+        )
+    };
     for oid in &orphan_ids {
         matched_ids.insert(oid.clone());
     }
@@ -658,7 +751,7 @@ pub fn discover_project_sessions(
             let Ok(meta_str) = fs::read_to_string(&meta_file) else {
                 continue;
             };
-            let matches_knowledge = meta_str.contains(&project_uri)
+            let matches_knowledge = (!is_home_root && meta_str.contains(&project_uri))
                 || matched_ids.iter().any(|cid| meta_str.contains(cid));
             if matches_knowledge {
                 if let Some(topic_name) = path.file_name().and_then(|n| n.to_str()) {
@@ -796,5 +889,50 @@ mod tests {
         assert_eq!(disc.knowledge_paths, vec!["knowledge/sync_topic"]);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_uri_matches_project_home_guard_and_cross_os_relative_match() {
+        // 1. $HOME root must NOT prefix-match child projects
+        assert!(uri_matches_project(
+            "file:///Users/alice",
+            "file:///Users/alice"
+        ));
+        assert!(!uri_matches_project(
+            "file:///Users/alice/Documents/my-project",
+            "file:///Users/alice"
+        ));
+        assert!(!uri_matches_project(
+            "file:///usr/local/corp/home/alice/Documents/my-project",
+            "file:///usr/local/corp/home/alice"
+        ));
+
+        // 2. Normal project matches exact and subdirectories
+        assert!(uri_matches_project(
+            "file:///Users/alice/Documents/my-project",
+            "file:///Users/alice/Documents/my-project"
+        ));
+        assert!(uri_matches_project(
+            "file:///Users/alice/Documents/my-project/sub",
+            "file:///Users/alice/Documents/my-project"
+        ));
+        assert!(!uri_matches_project(
+            "file:///Users/alice/Documents/my-project-2",
+            "file:///Users/alice/Documents/my-project"
+        ));
+
+        // 3. Cross-OS home mount points for the same username & relative project path match
+        assert!(uri_matches_project(
+            "file:///usr/local/corp/home/alice/Documents/my-project",
+            "file:///Users/alice/Documents/my-project"
+        ));
+        assert!(uri_matches_project(
+            "file:///Users/alice/Documents/my-project/sub",
+            "file:///usr/local/corp/home/alice/Documents/my-project"
+        ));
+        assert!(!uri_matches_project(
+            "file:///usr/local/corp/home/bob/Documents/my-project",
+            "file:///Users/alice/Documents/my-project"
+        ));
     }
 }

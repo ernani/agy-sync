@@ -774,8 +774,58 @@ pub fn rsync_workspace_dir(
     Ok(String::new())
 }
 
+/// Raises the process soft file-descriptor limit (`RLIMIT_NOFILE`) on Unix/macOS
+/// so large session stores and child `rsync` processes do not hit `EMFILE` ("Too many open files"),
+/// especially on macOS where the default soft limit is often 256.
+pub fn ensure_sufficient_fd_limit() {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    unsafe {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct RLimit {
+            rlim_cur: u64,
+            rlim_max: u64,
+        }
+        #[cfg(target_os = "macos")]
+        const RLIMIT_NOFILE: i32 = 8;
+        #[cfg(target_os = "linux")]
+        const RLIMIT_NOFILE: i32 = 7;
+
+        extern "C" {
+            fn getrlimit(resource: i32, rlp: *mut RLimit) -> i32;
+            fn setrlimit(resource: i32, rlp: *const RLimit) -> i32;
+        }
+
+        let mut lim = RLimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if getrlimit(RLIMIT_NOFILE, &mut lim) == 0 && lim.rlim_cur < 10240 {
+            for &target in &[65536u64, 32768, 24576, 10240, 4096] {
+                let desired = if lim.rlim_max > 0 {
+                    target.min(lim.rlim_max)
+                } else {
+                    target
+                };
+                if desired <= lim.rlim_cur {
+                    continue;
+                }
+                let next = RLimit {
+                    rlim_cur: desired,
+                    rlim_max: lim.rlim_max,
+                };
+                if setrlimit(RLIMIT_NOFILE, &next) == 0 {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+const RSYNC_FILES_FROM_BATCH_SIZE: usize = 64;
+
 /// Synchronizes a specific list of relative paths inside a harness directory (or `.gemini` root when `harness_subdir == ""`)
-/// using `rsync -avz -r --files-from`.
+/// using `rsync -avz -r --files-from`, batched in chunks of at most 64 paths to bound open file descriptors.
 pub fn rsync_harness_relative_paths(
     probe: &RemoteProbe,
     harness_subdir: &str,
@@ -789,9 +839,7 @@ pub fn rsync_harness_relative_paths(
         return Ok(String::new());
     }
 
-    let list_file = tempfile::NamedTempFile::new()?;
-    let list_content = relative_paths.join("\n") + "\n";
-    fs::write(list_file.path(), list_content)?;
+    ensure_sufficient_fd_limit();
 
     let remote_dir_str = probe.remote_harness_dir(harness_subdir);
     let local_slash = format!("{}/", local_root_dir.to_string_lossy().trim_end_matches('/'));
@@ -812,37 +860,43 @@ pub fn rsync_harness_relative_paths(
         }
     };
 
-    let mut cmd = Command::new("rsync");
-    cmd.arg("-avz")
-        .arg("-h")
-        .arg("--partial")
-        .arg("--progress")
-        .arg("-r")
-        .arg("--files-from")
-        .arg(list_file.path());
+    for chunk in relative_paths.chunks(RSYNC_FILES_FROM_BATCH_SIZE) {
+        let list_file = tempfile::NamedTempFile::new()?;
+        let list_content = chunk.join("\n") + "\n";
+        fs::write(list_file.path(), list_content)?;
 
-    if update_only {
-        cmd.arg("-u");
-    }
-    if dry_run {
-        cmd.arg("--dry-run");
-    }
-    if matches!(probe.endpoint, RemoteEndpoint::Ssh { .. }) {
-        cmd.arg("-e").arg(probe.endpoint.rsync_ssh_transport_cmd());
-    }
+        let mut cmd = Command::new("rsync");
+        cmd.arg("-avz")
+            .arg("-h")
+            .arg("--partial")
+            .arg("--progress")
+            .arg("-r")
+            .arg("--files-from")
+            .arg(list_file.path());
 
-    if push {
-        cmd.arg(&local_slash).arg(&remote_slash);
-    } else {
-        cmd.arg(&remote_slash).arg(&local_slash);
-    }
+        if update_only {
+            cmd.arg("-u");
+        }
+        if dry_run {
+            cmd.arg("--dry-run");
+        }
+        if matches!(probe.endpoint, RemoteEndpoint::Ssh { .. }) {
+            cmd.arg("-e").arg(probe.endpoint.rsync_ssh_transport_cmd());
+        }
 
-    cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-    let status = cmd
-        .status()
-        .context("Failed to execute rsync --files-from for harness artifacts")?;
-    if !status.success() {
-        bail!("Harness artifacts rsync failed (status {})", status);
+        if push {
+            cmd.arg(&local_slash).arg(&remote_slash);
+        } else {
+            cmd.arg(&remote_slash).arg(&local_slash);
+        }
+
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        let status = cmd
+            .status()
+            .context("Failed to execute rsync --files-from for harness artifacts")?;
+        if !status.success() {
+            bail!("Harness artifacts rsync failed (status {})", status);
+        }
     }
     Ok(String::new())
 }

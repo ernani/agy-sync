@@ -1,15 +1,19 @@
-use crate::discovery::{discover_project_sessions, normalize_project_path, ProjectDiscovery};
+use crate::discovery::{
+    discover_project_sessions, is_home_or_root_path, normalize_project_path, ProjectDiscovery,
+};
 use crate::harnesses::{
     discover_single_harness, merge_legacy_gemini_cli_metadata, sync_config_project_files,
     HarnessKind,
 };
 use crate::index_merge::{
-    export_project_manifest, merge_project_manifest, remap_conversation_artifacts, MergeStats,
+    export_project_manifest, find_sessions_with_home_prefix, merge_project_manifest,
+    remap_conversation_artifacts, MergeStats,
 };
 use crate::transport::{
-    probe_remote, push_staged_remote_harness_index, remote_checkpoint_or_clean_harness_wals,
-    rsync_harness_relative_paths, rsync_workspace_dir, stage_remote_gemini_metadata,
-    stage_remote_harness_index, RemoteEndpoint, RemoteProbe, RsyncTransferOpts,
+    ensure_sufficient_fd_limit, probe_remote, push_staged_remote_harness_index,
+    remote_checkpoint_or_clean_harness_wals, rsync_harness_relative_paths, rsync_workspace_dir,
+    stage_remote_gemini_metadata, stage_remote_harness_index, RemoteEndpoint, RemoteProbe,
+    RsyncTransferOpts,
 };
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -638,7 +642,15 @@ fn run_session_harness(
     for cid in &delta_both_cids {
         if let Some(sess) = remote_discovery.sessions.get(cid) {
             for rel in &sess.relative_paths {
-                pull_rel_set.insert(rel.clone());
+                // When step_count and last_modified_time are already equal on Local and Remote,
+                // only delta-sync non-database/non-protobuf artifacts (e.g. brain/<cid> markdown files)
+                // so machine-remapped conversations/<cid>.db and implicit/<cid>.pb are never clobbered.
+                if !rel.starts_with("conversations/")
+                    && !rel.starts_with("implicit/")
+                    && !rel.starts_with("context_state/")
+                {
+                    pull_rel_set.insert(rel.clone());
+                }
             }
         }
     }
@@ -678,9 +690,11 @@ fn run_session_harness(
                 );
             }
             if remap_enabled {
+                let mut pull_remap_cids = pulled_cids.clone();
+                pull_remap_cids.extend(delta_both_cids.iter().cloned());
                 remap_conversation_artifacts(
                     &local_harness_dir,
-                    &pulled_cids,
+                    &pull_remap_cids,
                     &probe.remote_home,
                     &config.local_home,
                     config.deep_remap,
@@ -713,6 +727,41 @@ fn run_session_harness(
         }
     }
 
+    // Self-heal any local session rows that still contain unremapped remote $HOME URIs
+    if remap_enabled && !config.dry_run {
+        let mut self_heal_cids =
+            find_sessions_with_home_prefix(&local_harness_dir, &probe.remote_home);
+        for (cid, sess) in &local_discovery.sessions {
+            if sess
+                .workspace_uris
+                .iter()
+                .any(|u| u.contains(&probe.remote_home))
+            {
+                self_heal_cids.insert(cid.clone());
+            }
+        }
+        if !self_heal_cids.is_empty() {
+            log_substep(&format!(
+                "Normalizing {} local session(s) with unremapped remote $HOME paths ...",
+                self_heal_cids.len()
+            ));
+            remap_conversation_artifacts(
+                &local_harness_dir,
+                &self_heal_cids,
+                &probe.remote_home,
+                &config.local_home,
+                config.deep_remap,
+            )?;
+            let remap_pair = Some((probe.remote_home.as_str(), config.local_home.as_str()));
+            let heal_manifest =
+                export_project_manifest(&local_harness_dir, &self_heal_cids, remap_pair)?;
+            let heal_stats = merge_project_manifest(&local_harness_dir, &heal_manifest, true)?;
+            local_merge_stats.summaries_upserted += heal_stats.summaries_upserted;
+            local_merge_stats.fts_chunks_updated += heal_stats.fts_chunks_updated;
+            local_merge_stats.protobuf_entries_updated += heal_stats.protobuf_entries_updated;
+        }
+    }
+
     // 2. Push Sessions (Local -> Remote)
     let mut push_rel_set = BTreeSet::new();
     for cid in &pushed_cids {
@@ -725,7 +774,12 @@ fn run_session_harness(
     for cid in &delta_both_cids {
         if let Some(sess) = local_discovery.sessions.get(cid) {
             for rel in &sess.relative_paths {
-                push_rel_set.insert(rel.clone());
+                if !rel.starts_with("conversations/")
+                    && !rel.starts_with("implicit/")
+                    && !rel.starts_with("context_state/")
+                {
+                    push_rel_set.insert(rel.clone());
+                }
             }
         }
     }
@@ -1040,7 +1094,23 @@ fn run_metadata_harness(
 
 /// Executes the configured `Inspect`, `Sync`, `Push`, or `Pull` operation across all `config.selected_harnesses`.
 pub fn run_engine(config: &EngineConfig) -> Result<SyncReport> {
+    ensure_sufficient_fd_limit();
+
     let norm_project = normalize_project_path(&config.project_path);
+    let norm_gemini_root = normalize_project_path(&config.local_gemini_root());
+
+    if config.mode != SyncMode::Inspect {
+        if is_home_or_root_path(&norm_project, &config.local_home)
+            || norm_project.starts_with(&norm_gemini_root)
+        {
+            bail!(
+                "Refusing to synchronize '{}' directly as a project workspace (it is $HOME or ~/.gemini). \
+                 Please run agy-sync from inside a specific project folder or pass -p <project-dir>.",
+                norm_project.display()
+            );
+        }
+    }
+
     let harnesses = if config.selected_harnesses.is_empty() {
         vec![HarnessKind::Agy20]
     } else {
