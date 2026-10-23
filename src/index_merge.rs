@@ -116,6 +116,14 @@ pub fn ensure_summary_db_schema(conn: &Connection) -> Result<()> {
         );",
     )
     .context("Failed to initialize conversation_summaries.db schema")?;
+    let _ = conn.execute(
+        "ALTER TABLE conversation_summaries ADD COLUMN raw_summary BLOB",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE conversation_summaries ADD COLUMN group_id TEXT NOT NULL DEFAULT ''",
+        [],
+    );
     Ok(())
 }
 
@@ -146,6 +154,7 @@ pub fn export_project_manifest(
         let conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to open {}", db_path.display()))?;
         let _ = conn.busy_timeout(std::time::Duration::from_millis(3000));
+        let _ = ensure_summary_db_schema(&conn);
 
         let mut sum_stmt = conn.prepare(
             "SELECT conversation_id, title, preview, step_count, last_modified_time,
