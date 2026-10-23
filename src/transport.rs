@@ -158,6 +158,7 @@ pub struct RemoteProbe {
     pub remote_home: String,
     pub remote_gemini_root: String,
     pub remote_project_path: String,
+    pub remote_has_rsync: bool,
 }
 
 impl RemoteProbe {
@@ -194,11 +195,26 @@ pub fn check_ssh_auth(endpoint: &RemoteEndpoint) -> Result<bool> {
     }
 }
 
+static REMOTE_HAS_RSYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Records whether the probed remote target environment has `rsync` installed in `$PATH`.
+pub fn set_remote_has_rsync(has_rsync: bool) {
+    REMOTE_HAS_RSYNC.store(has_rsync, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Returns whether the probed remote target environment has `rsync` available.
+pub fn remote_has_rsync() -> bool {
+    REMOTE_HAS_RSYNC.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Returns `true` when `tar`-over-`ssh` streaming should be used instead of `rsync`
-/// (automatically enabled on native Windows when `rsync` is absent, when `rsync` is not in `PATH`,
-/// or when `AGY_SYNC_FORCE_TAR=1` is set).
+/// (automatically enabled on native Windows when `rsync` is absent, when `rsync` is not in `PATH` locally,
+/// when the probed remote host lacks `rsync`, or when `AGY_SYNC_FORCE_TAR=1` is set).
 pub fn should_use_tar_transport() -> bool {
     if std::env::var("AGY_SYNC_FORCE_TAR").ok().as_deref() == Some("1") {
+        return true;
+    }
+    if !remote_has_rsync() {
         return true;
     }
     static HAS_RSYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -512,24 +528,35 @@ pub fn authenticate_ssh_interactive(
     Ok(())
 }
 
-/// Probes the remote endpoint to determine its `$HOME` directory and calculate the counterpart
-/// project path and `~/.gemini` paths.
+/// Probes the remote endpoint to determine its `$HOME` directory, check `rsync` availability,
+/// and calculate the counterpart project path and `~/.gemini` paths.
 pub fn probe_remote(
     endpoint: &RemoteEndpoint,
     local_home: &str,
     local_project_path: &Path,
 ) -> Result<RemoteProbe> {
-    let remote_home = match endpoint {
+    let (remote_home, remote_has_rsync) = match endpoint {
         RemoteEndpoint::LocalRoot { root_home } => {
-            root_home.to_string_lossy().trim_end_matches('/').to_string()
+            let has_r = Command::new("rsync")
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            (
+                root_home.to_string_lossy().trim_end_matches('/').to_string(),
+                has_r,
+            )
         }
         RemoteEndpoint::Ssh { .. } => {
             let target = endpoint.ssh_target().unwrap();
+            let probe_cmd = "printf '%s\n' \"$HOME\"; command -v rsync >/dev/null 2>&1 && printf 'RSYNC=1\n' || printf 'RSYNC=0\n'";
             let mut cmd = Command::new("ssh");
             for arg in endpoint.ssh_args(true) {
                 cmd.arg(arg);
             }
-            cmd.arg(&target).arg("printf '%s' \"$HOME\"");
+            cmd.arg(&target).arg(probe_cmd);
             let mut output = cmd
                 .output()
                 .with_context(|| format!("Failed to execute ssh to host '{}'", target))?;
@@ -541,7 +568,7 @@ pub fn probe_remote(
                 }
                 retry_cmd
                     .arg(&target)
-                    .arg("printf '%s' \"$HOME\"")
+                    .arg(probe_cmd)
                     .stdin(Stdio::inherit())
                     .stderr(Stdio::inherit());
                 output = retry_cmd
@@ -557,13 +584,19 @@ pub fn probe_remote(
                     stderr.trim()
                 );
             }
-            let out_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if out_str.is_empty() {
+            let out_str = String::from_utf8_lossy(&output.stdout);
+            let mut lines = out_str.lines();
+            let home_line = lines.next().unwrap_or("").trim().to_string();
+            if home_line.is_empty() {
                 bail!("SSH probe to '{}' returned empty $HOME", target);
             }
-            out_str.trim_end_matches('/').to_string()
+            let has_rsync_line = lines.next().unwrap_or("").trim();
+            let has_rsync = has_rsync_line == "RSYNC=1";
+            (home_line.trim_end_matches('/').to_string(), has_rsync)
         }
     };
+
+    set_remote_has_rsync(remote_has_rsync);
 
     let local_proj_norm =
         crate::config::normalize_home_path_string(&local_project_path.to_string_lossy());
@@ -587,6 +620,7 @@ pub fn probe_remote(
         remote_home,
         remote_gemini_root,
         remote_project_path,
+        remote_has_rsync,
     })
 }
 
@@ -1299,6 +1333,17 @@ pub fn rsync_harness_relative_paths(
     Ok(String::new())
 }
 
+/// Attempts a graceful restart of known agent web hub services (such as `rshelld-jetski-hub`)
+/// so that updated SQLite summaries and protobuf caches are immediately reloaded in the UI.
+pub fn reload_remote_agent_services_if_present(endpoint: &RemoteEndpoint) -> Result<()> {
+    if matches!(endpoint, RemoteEndpoint::LocalRoot { .. }) {
+        return Ok(());
+    }
+    let script = "systemctl --user is-active --quiet rshelld-jetski-hub 2>/dev/null && systemctl --user restart rshelld-jetski-hub 2>/dev/null || true";
+    let _ = run_remote_script(endpoint, script);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1372,5 +1417,20 @@ mod tests {
             "/home/devuser/Documents/my-repo"
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_remote_rsync_detection_and_tar_fallback() {
+        set_remote_has_rsync(true);
+        // With remote_has_rsync = true, behavior depends on local rsync/env
+        let default_mode = should_use_tar_transport();
+
+        // If remote has no rsync, should_use_tar_transport must always return true
+        set_remote_has_rsync(false);
+        assert!(should_use_tar_transport());
+
+        // Restore
+        set_remote_has_rsync(true);
+        assert_eq!(should_use_tar_transport(), default_mode);
     }
 }
