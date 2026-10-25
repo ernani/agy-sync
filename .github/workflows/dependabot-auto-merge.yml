@@ -1,0 +1,46 @@
+name: Dependabot Auto-Merge
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  dependabot:
+    runs-on: ubuntu-latest
+    if: >
+      github.actor == 'dependabot[bot]' ||
+      contains(github.event.pull_request.labels.*.name, 'automerge')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build & Test
+        run: |
+          cargo check --all-targets
+          cargo test --lib
+
+      - name: Approve PR
+        run: gh pr review --approve "$PR_URL" || true
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Auto-merge PR or request rebase on conflict
+        run: |
+          if ! gh pr merge --squash --delete-branch "$PR_URL"; then
+            echo "Auto-merge failed (possible conflict after prior merge). Requesting Dependabot rebase..."
+            gh pr comment "$PR_URL" --body "@dependabot rebase" || true
+          fi
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
