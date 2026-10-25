@@ -27,7 +27,7 @@ jobs:
       - name: Build & Test
         run: |
           cargo check --all-targets
-          cargo test --lib
+          cargo test --workspace
 
       - name: Approve PR
         run: gh pr review --approve "$PR_URL" || true

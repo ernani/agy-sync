@@ -1,4 +1,4 @@
-use agy_sync::discovery::normalize_project_path;
+use agy_sync::discovery::{normalize_project_path, path_to_file_uri};
 use agy_sync::engine::{run_engine, EngineConfig, SessionAction, SyncMode};
 use agy_sync::harnesses::HarnessKind;
 use agy_sync::index_merge::ensure_summary_db_schema;
@@ -75,8 +75,8 @@ fn test_bidirectional_sync_mac_and_remote_end_to_end() {
     fs::create_dir_all(&mac_agy).unwrap();
     fs::create_dir_all(&remote_agy).unwrap();
 
-    let mac_proj_uri = format!("file://{}", mac_proj.display());
-    let remote_proj_uri = format!("file://{}", remote_proj.display());
+    let mac_proj_uri = path_to_file_uri(&mac_proj);
+    let remote_proj_uri = path_to_file_uri(&remote_proj);
 
     let s1 = "11111111-1111-1111-1111-111111111111"; // Newer on Mac (20 steps)
     let s1_sub = "11111111-2222-3333-4444-555555555555"; // Subagent of S1 on Mac (6 steps)
