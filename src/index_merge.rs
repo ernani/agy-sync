@@ -408,7 +408,7 @@ pub fn export_project_manifest(
 /// with `target_project_id`, updating both the SQLite row metadata and the Protobuf `raw_summary`
 /// / `protobuf_entries` wire-format payloads.
 ///
-/// This ensures sessions appear grouped under the project workspace in Agy Web Hub and IDEs.
+/// This ensures sessions appear grouped under the project workspace in Jetski Web and IDEs.
 pub fn remap_manifest_project_ids(
     manifest: &mut ProjectIndexManifest,
     target_project_id: &str,

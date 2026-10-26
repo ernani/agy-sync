@@ -290,7 +290,7 @@ pub fn encode_raw_fields(fields: &[RawField]) -> Vec<u8> {
 /// Updates or inserts Field 18 (project_id string) inside Field 17 (context submessage)
 /// of a `TrajectorySummary` Protobuf payload, recalculating parent varint length delimiters.
 ///
-/// This ensures sessions appear nested under the workspace in Agy Web Hub / Agy IDE rather
+/// This ensures sessions appear nested under the workspace in Jetski Web / Agy IDE rather
 /// than being hidden or relegated to `default-cli-project`.
 pub fn set_summary_project_id(buf: &[u8], project_id: &str) -> Result<Vec<u8>> {
     if buf.is_empty() || project_id.is_empty() {
