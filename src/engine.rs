@@ -873,6 +873,7 @@ fn run_session_harness(
             .iter()
             .next()
             .cloned()
+            .or_else(|| remote_discovery.matched_project_ids.iter().next().cloned())
             .or_else(|| {
                 let proj_name = norm_project
                     .file_name()

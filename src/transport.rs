@@ -1333,13 +1333,13 @@ pub fn rsync_harness_relative_paths(
     Ok(String::new())
 }
 
-/// Attempts a graceful restart of known agent web hub services (such as `rshelld-jetski-hub`)
+/// Attempts a graceful restart of any active Agy Web Hub user service on the remote host
 /// so that updated SQLite summaries and protobuf caches are immediately reloaded in the UI.
 pub fn reload_remote_agent_services_if_present(endpoint: &RemoteEndpoint) -> Result<()> {
     if matches!(endpoint, RemoteEndpoint::LocalRoot { .. }) {
         return Ok(());
     }
-    let script = "systemctl --user is-active --quiet rshelld-jetski-hub 2>/dev/null && systemctl --user restart rshelld-jetski-hub 2>/dev/null || true";
+    let script = "for svc in $(systemctl --user list-units --type=service --state=active --no-legend 2>/dev/null | awk '{print $1}' | grep -E '(agy|agent).*hub|rshelld-.*-hub'); do systemctl --user restart \"$svc\" 2>/dev/null || true; done";
     let _ = run_remote_script(endpoint, script);
     Ok(())
 }

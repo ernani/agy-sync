@@ -475,8 +475,7 @@ pub fn ensure_workspace_project_manifest(
     project_path: &Path,
     project_name: &str,
 ) -> Result<String> {
-    let norm_path = crate::config::normalize_home_path_string(&project_path.to_string_lossy());
-    let project_uri = format!("file://{}", norm_path);
+    let project_uri = path_to_file_uri(project_path);
 
     let matched = crate::discovery::find_matching_config_project_ids(gemini_root, &project_uri);
     if let Some(existing_id) = matched.into_iter().next() {
