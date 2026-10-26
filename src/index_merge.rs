@@ -1,5 +1,5 @@
 use crate::discovery::find_summary_pb_files;
-use crate::protobuf::{rewrite_protobuf_strings, ProtobufSummariesMap};
+use crate::protobuf::{rewrite_protobuf_strings, set_summary_project_id, ProtobufSummariesMap};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -402,6 +402,40 @@ pub fn export_project_manifest(
     }
 
     Ok(manifest)
+}
+
+/// Re-stamps all sessions in `manifest` whose `project_id` is empty or `"default-cli-project"`
+/// with `target_project_id`, updating both the SQLite row metadata and the Protobuf `raw_summary`
+/// / `protobuf_entries` wire-format payloads.
+///
+/// This ensures sessions appear grouped under the project workspace in Jetski Web and IDEs.
+pub fn remap_manifest_project_ids(
+    manifest: &mut ProjectIndexManifest,
+    target_project_id: &str,
+) {
+    if target_project_id.is_empty() {
+        return;
+    }
+    let mut preserve_custom_cids = BTreeSet::new();
+    for s_row in &mut manifest.summaries {
+        if s_row.project_id.is_empty() || s_row.project_id == "default-cli-project" {
+            s_row.project_id = target_project_id.to_string();
+            if !s_row.raw_summary.is_empty() {
+                if let Ok(updated) = set_summary_project_id(&s_row.raw_summary, target_project_id) {
+                    s_row.raw_summary = updated;
+                }
+            }
+        } else {
+            preserve_custom_cids.insert(s_row.conversation_id.clone());
+        }
+    }
+    for (cid, raw_bytes) in &mut manifest.protobuf_entries {
+        if !preserve_custom_cids.contains(cid) {
+            if let Ok(updated) = set_summary_project_id(raw_bytes, target_project_id) {
+                *raw_bytes = updated;
+            }
+        }
+    }
 }
 
 /// Creates a lightweight rolling backup of `conversation_summaries.db` and `*_summaries_proto.pb`
@@ -974,5 +1008,59 @@ mod tests {
             pb_back_to_win,
             make_dummy_proto_with_uri("file:///C:/Users/devuser/proj")
         );
+    }
+
+    #[test]
+    fn test_remap_manifest_project_ids() {
+        let mut manifest = ProjectIndexManifest::default();
+        let pb_c1 = set_summary_project_id(
+            &make_dummy_proto_with_uri("file:///Users/dev/proj"),
+            "default-cli-project",
+        )
+        .unwrap();
+        let pb_c2 = set_summary_project_id(
+            &make_dummy_proto_with_uri("file:///Users/dev/proj"),
+            "custom-proj-id",
+        )
+        .unwrap();
+
+        manifest.summaries.push(SummaryRow {
+            conversation_id: "c1".to_string(),
+            title: "Test".to_string(),
+            preview: "Prev".to_string(),
+            step_count: 10,
+            last_modified_time: "2026-10-23".to_string(),
+            workspace_uris: "[]".to_string(),
+            status: "IDLE".to_string(),
+            agent_name: "".to_string(),
+            parent_conversation_id: "".to_string(),
+            project_id: "default-cli-project".to_string(),
+            last_user_input_time: "".to_string(),
+            raw_summary: pb_c1.clone(),
+        });
+        manifest.summaries.push(SummaryRow {
+            conversation_id: "c2".to_string(),
+            title: "Already Set".to_string(),
+            preview: "Prev".to_string(),
+            step_count: 5,
+            last_modified_time: "2026-10-23".to_string(),
+            workspace_uris: "[]".to_string(),
+            status: "IDLE".to_string(),
+            agent_name: "".to_string(),
+            parent_conversation_id: "".to_string(),
+            project_id: "custom-proj-id".to_string(),
+            last_user_input_time: "".to_string(),
+            raw_summary: pb_c2.clone(),
+        });
+        manifest.protobuf_entries.insert("c1".to_string(), pb_c1);
+        manifest
+            .protobuf_entries
+            .insert("c2".to_string(), pb_c2.clone());
+
+        remap_manifest_project_ids(&mut manifest, "target-uuid-1234");
+        assert_eq!(manifest.summaries[0].project_id, "target-uuid-1234");
+        assert_eq!(manifest.summaries[1].project_id, "custom-proj-id");
+        assert_ne!(manifest.protobuf_entries["c1"], pb_c2);
+        assert_eq!(manifest.protobuf_entries["c2"], pb_c2);
     }
 }

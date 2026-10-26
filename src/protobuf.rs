@@ -185,6 +185,165 @@ pub fn rewrite_protobuf_strings(buf: &[u8], from_str: &str, to_str: &str) -> Res
     Ok(out)
 }
 
+/// Represents the low-level wire-type value of a Protobuf field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireValue {
+    Varint(u64),
+    Fixed64([u8; 8]),
+    LengthDelimited(Vec<u8>),
+    Fixed32([u8; 4]),
+}
+
+/// A parsed Protobuf field preserving wire tag and raw payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawField {
+    pub tag: u64,
+    pub wire_type: u32,
+    pub value: WireValue,
+}
+
+/// Decodes a flat list of Protobuf fields from `buf`.
+pub fn decode_raw_fields(buf: &[u8]) -> Result<Vec<RawField>> {
+    let mut fields = Vec::new();
+    let mut pos = 0;
+    while pos < buf.len() {
+        let (tag_wire, tag_len) = decode_varint(&buf[pos..])?;
+        pos += tag_len;
+        let wire_type = (tag_wire & 0x07) as u32;
+        let field_num = tag_wire >> 3;
+        match wire_type {
+            0 => {
+                let (val, v_len) = decode_varint(&buf[pos..])?;
+                pos += v_len;
+                fields.push(RawField {
+                    tag: field_num,
+                    wire_type,
+                    value: WireValue::Varint(val),
+                });
+            }
+            1 => {
+                if pos + 8 > buf.len() {
+                    bail!("Unexpected EOF in 64-bit field");
+                }
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&buf[pos..pos + 8]);
+                pos += 8;
+                fields.push(RawField {
+                    tag: field_num,
+                    wire_type,
+                    value: WireValue::Fixed64(bytes),
+                });
+            }
+            2 => {
+                let (len, l_len) = decode_varint(&buf[pos..])?;
+                pos += l_len;
+                let len_usize = len as usize;
+                if pos + len_usize > buf.len() {
+                    bail!("Unexpected EOF in length-delimited field");
+                }
+                let payload = buf[pos..pos + len_usize].to_vec();
+                pos += len_usize;
+                fields.push(RawField {
+                    tag: field_num,
+                    wire_type,
+                    value: WireValue::LengthDelimited(payload),
+                });
+            }
+            5 => {
+                if pos + 4 > buf.len() {
+                    bail!("Unexpected EOF in 32-bit field");
+                }
+                let mut bytes = [0u8; 4];
+                bytes.copy_from_slice(&buf[pos..pos + 4]);
+                pos += 4;
+                fields.push(RawField {
+                    tag: field_num,
+                    wire_type,
+                    value: WireValue::Fixed32(bytes),
+                });
+            }
+            other => bail!("Unsupported wire type: {}", other),
+        }
+    }
+    Ok(fields)
+}
+
+/// Encodes a list of `RawField`s back into wire format bytes.
+pub fn encode_raw_fields(fields: &[RawField]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for f in fields {
+        let tag_wire = (f.tag << 3) | ((f.wire_type as u64) & 0x07);
+        encode_varint(tag_wire, &mut out);
+        match &f.value {
+            WireValue::Varint(v) => encode_varint(*v, &mut out),
+            WireValue::Fixed64(bytes) => out.extend_from_slice(bytes),
+            WireValue::LengthDelimited(bytes) => {
+                encode_varint(bytes.len() as u64, &mut out);
+                out.extend_from_slice(bytes);
+            }
+            WireValue::Fixed32(bytes) => out.extend_from_slice(bytes),
+        }
+    }
+    out
+}
+
+/// Updates or inserts Field 18 (project_id string) inside Field 17 (context submessage)
+/// of a `TrajectorySummary` Protobuf payload, recalculating parent varint length delimiters.
+///
+/// This ensures sessions appear nested under the workspace in Jetski Web / Agy IDE rather
+/// than being hidden or relegated to `default-cli-project`.
+pub fn set_summary_project_id(buf: &[u8], project_id: &str) -> Result<Vec<u8>> {
+    if buf.is_empty() || project_id.is_empty() {
+        return Ok(buf.to_vec());
+    }
+    let mut top_fields = match decode_raw_fields(buf) {
+        Ok(f) => f,
+        Err(_) => return Ok(buf.to_vec()),
+    };
+
+    let mut found_context = false;
+    for f in &mut top_fields {
+        if f.tag == 17 && f.wire_type == 2 {
+            if let WireValue::LengthDelimited(ref sub_payload) = f.value {
+                if let Ok(mut sub_fields) = decode_raw_fields(sub_payload) {
+                    let mut found_p_id = false;
+                    for sf in &mut sub_fields {
+                        if sf.tag == 18 && sf.wire_type == 2 {
+                            sf.value = WireValue::LengthDelimited(project_id.as_bytes().to_vec());
+                            found_p_id = true;
+                            break;
+                        }
+                    }
+                    if !found_p_id {
+                        sub_fields.push(RawField {
+                            tag: 18,
+                            wire_type: 2,
+                            value: WireValue::LengthDelimited(project_id.as_bytes().to_vec()),
+                        });
+                    }
+                    f.value = WireValue::LengthDelimited(encode_raw_fields(&sub_fields));
+                    found_context = true;
+                }
+            }
+        }
+    }
+
+    if !found_context {
+        let sub_fields = vec![RawField {
+            tag: 18,
+            wire_type: 2,
+            value: WireValue::LengthDelimited(project_id.as_bytes().to_vec()),
+        }];
+        top_fields.push(RawField {
+            tag: 17,
+            wire_type: 2,
+            value: WireValue::LengthDelimited(encode_raw_fields(&sub_fields)),
+        });
+    }
+
+    Ok(encode_raw_fields(&top_fields))
+}
+
 /// Extracts all printable ASCII substrings of length >= `min_len` from a binary buffer.
 pub fn extract_printable_strings(buf: &[u8], min_len: usize) -> Vec<String> {
     let mut results = Vec::new();
@@ -515,5 +674,55 @@ mod tests {
             &[0x0a, 0x05, b'h', b'e', b'l', b'l', b'o']
         );
         assert_eq!(parsed.extra_top_fields.len(), 1);
+    }
+
+    #[test]
+    fn test_set_summary_project_id_roundtrip() {
+        // Build a mock TrajectorySummary:
+        // Top field 1: title (string)
+        // Top field 17: context submessage
+        //   Sub field 1: folderUri (string)
+        //   Sub field 18: project_id (string: "default-cli-project")
+        let mut sub = Vec::new();
+        let uri = b"file:///proj/abc";
+        encode_varint(0x0a, &mut sub);
+        encode_varint(uri.len() as u64, &mut sub);
+        sub.extend_from_slice(uri);
+        let cli_proj = b"default-cli-project";
+        encode_varint((18 << 3) | 2, &mut sub);
+        encode_varint(cli_proj.len() as u64, &mut sub);
+        sub.extend_from_slice(cli_proj);
+
+        let mut top = Vec::new();
+        encode_varint(0x0a, &mut top);
+        encode_varint(5, &mut top);
+        top.extend_from_slice(b"Title");
+        encode_varint((17 << 3) | 2, &mut top);
+        encode_varint(sub.len() as u64, &mut top);
+        top.extend_from_slice(&sub);
+
+        let target_uuid = "79ad68c4-ecb9-4454-ac43-bc6c9f852a01";
+        let updated = set_summary_project_id(&top, target_uuid).unwrap();
+        assert!(is_likely_protobuf_message(&updated));
+
+        // Ensure target_uuid is present and default-cli-project is replaced
+        assert!(updated
+            .windows(target_uuid.len())
+            .any(|w| w == target_uuid.as_bytes()));
+        assert!(!updated
+            .windows(cli_proj.len())
+            .any(|w| w == cli_proj));
+        assert!(updated.windows(uri.len()).any(|w| w == uri));
+
+        // Also test inserting project_id into a message without field 17
+        let mut top_no_ctx = Vec::new();
+        encode_varint(0x0a, &mut top_no_ctx);
+        encode_varint(5, &mut top_no_ctx);
+        top_no_ctx.extend_from_slice(b"Title");
+        let inserted = set_summary_project_id(&top_no_ctx, target_uuid).unwrap();
+        assert!(is_likely_protobuf_message(&inserted));
+        assert!(inserted
+            .windows(target_uuid.len())
+            .any(|w| w == target_uuid.as_bytes()));
     }
 }

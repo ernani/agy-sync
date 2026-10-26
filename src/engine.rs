@@ -12,9 +12,9 @@ use crate::index_merge::{
 };
 use crate::transport::{
     ensure_sufficient_fd_limit, probe_remote, push_staged_remote_harness_index,
-    remote_checkpoint_or_clean_harness_wals, rsync_harness_relative_paths, rsync_workspace_dir,
-    stage_remote_gemini_metadata, stage_remote_harness_index, RemoteEndpoint, RemoteProbe,
-    RsyncTransferOpts,
+    reload_remote_agent_services_if_present, remote_checkpoint_or_clean_harness_wals,
+    rsync_harness_relative_paths, rsync_workspace_dir, stage_remote_gemini_metadata,
+    stage_remote_harness_index, RemoteEndpoint, RemoteProbe, RsyncTransferOpts,
 };
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -711,8 +711,11 @@ fn run_session_harness(
         ));
         let remap_pair =
             remap_enabled.then_some((probe.remote_home.as_str(), config.local_home.as_str()));
-        let remote_manifest =
+        let mut remote_manifest =
             export_project_manifest(&staging_remote_harness, &pulled_cids, remap_pair)?;
+        if let Some(ref pid) = remote_discovery.matched_project_ids.iter().next().cloned() {
+            crate::index_merge::remap_manifest_project_ids(&mut remote_manifest, pid);
+        }
         let force = config.mode == SyncMode::Pull;
         local_merge_stats =
             merge_project_manifest(&local_harness_dir, &remote_manifest, force)?;
@@ -861,24 +864,53 @@ fn run_session_harness(
         ));
         let remap_pair =
             remap_enabled.then_some((config.local_home.as_str(), probe.remote_home.as_str()));
-        let local_manifest =
+        let mut local_manifest =
             export_project_manifest(&local_harness_dir, &pushed_cids, remap_pair)?;
+
+        // Ensure workspace project manifest exists locally and map target_project_id
+        let target_project_id = local_discovery
+            .matched_project_ids
+            .iter()
+            .next()
+            .cloned()
+            .or_else(|| remote_discovery.matched_project_ids.iter().next().cloned())
+            .or_else(|| {
+                let proj_name = norm_project
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("project");
+                crate::harnesses::ensure_workspace_project_manifest(
+                    &config.local_gemini_root(),
+                    norm_project,
+                    proj_name,
+                )
+                .ok()
+            });
+
+        if let Some(ref pid) = target_project_id {
+            crate::index_merge::remap_manifest_project_ids(&mut local_manifest, pid);
+        }
+
         let force = config.mode == SyncMode::Push;
         remote_merge_stats =
             merge_project_manifest(&staging_remote_harness, &local_manifest, force)?;
         push_staged_remote_harness_index(probe, subdir, &staging_remote_harness, config.dry_run)?;
 
-        if !local_discovery.matched_project_ids.is_empty() {
+        let mut all_project_ids = local_discovery.matched_project_ids.clone();
+        if let Some(ref pid) = target_project_id {
+            all_project_ids.insert(pid.clone());
+        }
+
+        if !all_project_ids.is_empty() {
             let push_cfg_root = staging_gemini_root.join("push_cfg_overlay");
             let count = sync_config_project_files(
                 &config.local_gemini_root(),
                 &push_cfg_root,
-                &local_discovery.matched_project_ids,
+                &all_project_ids,
                 remap_pair,
             )?;
             if count > 0 {
-                let cfg_rels: Vec<String> = local_discovery
-                    .matched_project_ids
+                let cfg_rels: Vec<String> = all_project_ids
                     .iter()
                     .map(|id| format!("config/projects/{}.json", id))
                     .collect();
@@ -893,6 +925,8 @@ fn run_session_harness(
                 );
             }
         }
+
+        let _ = reload_remote_agent_services_if_present(&probe.endpoint);
     }
 
     Ok(HarnessSyncReport {
