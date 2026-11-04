@@ -186,7 +186,15 @@ fn resolve_harnesses(
         .map(|d| d.kind)
         .collect();
     if active.is_empty() {
-        Ok(vec![HarnessKind::Agy20])
+        let session_harnesses: Vec<HarnessKind> = available
+            .into_iter()
+            .filter(|k| k.session_subdir().is_some())
+            .collect();
+        if session_harnesses.is_empty() {
+            Ok(vec![HarnessKind::Agy20])
+        } else {
+            Ok(session_harnesses)
+        }
     } else {
         Ok(active)
     }

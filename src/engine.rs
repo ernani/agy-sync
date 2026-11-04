@@ -1,6 +1,6 @@
 use crate::discovery::{
-    discover_project_sessions, is_home_or_root_path, normalize_project_path, path_to_file_uri,
-    ProjectDiscovery,
+    discover_project_sessions, hydrate_missing_counterpart_sessions, is_home_or_root_path,
+    normalize_project_path, path_to_file_uri, ProjectDiscovery,
 };
 use crate::harnesses::{
     discover_single_harness, merge_legacy_gemini_cli_metadata, sync_config_project_files,
@@ -474,7 +474,7 @@ fn run_session_harness(
             kind.display_path()
         ));
     }
-    let local_discovery = discover_project_sessions(norm_project, &local_harness_dir)?;
+    let mut local_discovery = discover_project_sessions(norm_project, &local_harness_dir)?;
 
     let Some(probe) = probe_opt else {
         return Ok(HarnessSyncReport {
@@ -504,7 +504,7 @@ fn run_session_harness(
     }
     stage_remote_harness_index(probe, subdir, &staging_remote_harness)?;
 
-    let remote_discovery = discover_project_sessions(
+    let mut remote_discovery = discover_project_sessions(
         Path::new(&probe.remote_project_path),
         &staging_remote_harness,
     )?;
@@ -518,6 +518,9 @@ fn run_session_harness(
 
     let mut all_cids: BTreeSet<String> = local_discovery.sessions.keys().cloned().collect();
     all_cids.extend(remote_discovery.sessions.keys().cloned());
+
+    hydrate_missing_counterpart_sessions(&mut local_discovery, &all_cids);
+    hydrate_missing_counterpart_sessions(&mut remote_discovery, &all_cids);
 
     for cid in &all_cids {
         let l_opt = local_discovery.sessions.get(cid);

@@ -880,15 +880,34 @@ pub fn stage_remote_harness_index(
                     false,
                 );
             } else {
+                let safe_target: String = target
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect();
+                let safe_sub: String = harness_subdir
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect();
+                let cache_dir = std::env::temp_dir()
+                    .join("agy-sync-stage-cache")
+                    .join(safe_target)
+                    .join(safe_sub);
+                let _ = fs::create_dir_all(&cache_dir);
+
                 for fname in files_to_pull {
                     let remote_spec = format!("{}:{}/{}", target, remote_dir_str, fname);
+                    let cached_file = cache_dir.join(&fname);
                     let mut cmd = Command::new("rsync");
                     cmd.arg("-az")
                         .arg("-e")
                         .arg(&transport_cmd)
                         .arg(&remote_spec)
-                        .arg(staging_harness_dir.join(&fname));
-                    let _ = cmd.output();
+                        .arg(&cached_file);
+                    if let Ok(out) = cmd.output() {
+                        if out.status.success() && cached_file.exists() {
+                            let _ = fs::copy(&cached_file, staging_harness_dir.join(&fname));
+                        }
+                    }
                 }
             }
         }
@@ -1080,6 +1099,22 @@ pub fn rsync_workspace_dir(
     push: bool,
     opts: &RsyncTransferOpts,
 ) -> Result<String> {
+    if push && !local_dir.exists() {
+        return Ok(String::new());
+    }
+    if !push {
+        let remote_exists = match &probe.endpoint {
+            RemoteEndpoint::LocalRoot { .. } => Path::new(&probe.remote_project_path).exists(),
+            RemoteEndpoint::Ssh { .. } => {
+                let script = format!("test -d {}", shell_quote(&probe.remote_project_path));
+                run_remote_script(&probe.endpoint, &script).is_ok()
+            }
+        };
+        if !remote_exists {
+            return Ok(String::new());
+        }
+    }
+
     if !opts.dry_run {
         if push {
             match &probe.endpoint {
@@ -1132,7 +1167,7 @@ pub fn rsync_workspace_dir(
         }
         RemoteEndpoint::Ssh { .. } => {
             let target = probe.endpoint.ssh_target().unwrap();
-            if !push {
+            if !push && !opts.dry_run {
                 let script = format!("mkdir -p {}", shell_quote(&probe.remote_project_path));
                 let _ = run_remote_script(&probe.endpoint, &script);
             }
