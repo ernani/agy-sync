@@ -159,6 +159,7 @@ pub struct RemoteProbe {
     pub remote_gemini_root: String,
     pub remote_project_path: String,
     pub remote_has_rsync: bool,
+    pub remote_existing_subdirs: BTreeSet<String>,
 }
 
 impl RemoteProbe {
@@ -535,7 +536,7 @@ pub fn probe_remote(
     local_home: &str,
     local_project_path: &Path,
 ) -> Result<RemoteProbe> {
-    let (remote_home, remote_has_rsync) = match endpoint {
+    let (remote_home, remote_has_rsync, remote_existing_subdirs) = match endpoint {
         RemoteEndpoint::LocalRoot { root_home } => {
             let has_r = Command::new("rsync")
                 .arg("--version")
@@ -544,14 +545,31 @@ pub fn probe_remote(
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
+            let mut subs = BTreeSet::new();
+            if let Ok(entries) = fs::read_dir(root_home.join(".gemini")) {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            subs.insert(name.to_string());
+                        }
+                    }
+                }
+            }
             (
                 root_home.to_string_lossy().trim_end_matches('/').to_string(),
                 has_r,
+                subs,
             )
         }
         RemoteEndpoint::Ssh { .. } => {
             let target = endpoint.ssh_target().unwrap();
-            let probe_cmd = "printf '%s\n' \"$HOME\"; command -v rsync >/dev/null 2>&1 && printf 'RSYNC=1\n' || printf 'RSYNC=0\n'";
+            let probe_cmd = "printf '%s\n' \"$HOME\"; \
+                             command -v rsync >/dev/null 2>&1 && printf 'RSYNC=1\n' || printf 'RSYNC=0\n'; \
+                             if [ -d \"$HOME/.gemini\" ]; then \
+                               for d in \"$HOME/.gemini\"/*; do \
+                                 if [ -d \"$d\" ]; then printf 'SUB:%s\n' \"${d##*/}\"; fi; \
+                               done; \
+                             fi";
             let mut cmd = Command::new("ssh");
             for arg in endpoint.ssh_args(true) {
                 cmd.arg(arg);
@@ -592,7 +610,15 @@ pub fn probe_remote(
             }
             let has_rsync_line = lines.next().unwrap_or("").trim();
             let has_rsync = has_rsync_line == "RSYNC=1";
-            (home_line.trim_end_matches('/').to_string(), has_rsync)
+            let mut subs = BTreeSet::new();
+            for l in lines {
+                if let Some(sub) = l.trim().strip_prefix("SUB:") {
+                    if !sub.is_empty() {
+                        subs.insert(sub.to_string());
+                    }
+                }
+            }
+            (home_line.trim_end_matches('/').to_string(), has_rsync, subs)
         }
     };
 
@@ -621,6 +647,7 @@ pub fn probe_remote(
         remote_gemini_root,
         remote_project_path,
         remote_has_rsync,
+        remote_existing_subdirs,
     })
 }
 
@@ -779,14 +806,26 @@ pub fn stage_remote_harness_index(
                 }
                 fs::copy(&db_file, staging_harness_dir.join("conversation_summaries.db"))?;
             }
+            let is_antigravity_family = harness_subdir.starts_with("antigravity");
             for pb_file in find_summary_pb_files(remote_dir) {
-                if let Some(fname) = pb_file.file_name() {
+                if let Some(fname) = pb_file.file_name().and_then(|n| n.to_str()) {
+                    if is_antigravity_family && fname != "agyhub_summaries_proto.pb" {
+                        continue;
+                    }
                     fs::copy(&pb_file, staging_harness_dir.join(fname))?;
                 }
             }
             let hist_file = remote_dir.join("history.jsonl");
             if hist_file.exists() {
                 fs::copy(&hist_file, staging_harness_dir.join("history.jsonl"))?;
+            }
+            if harness_subdir == "antigravity" {
+                for extra in ["settings.json", "antigravity_state.pbtxt"] {
+                    let src_extra = remote_dir.join(extra);
+                    if src_extra.exists() {
+                        let _ = fs::copy(&src_extra, staging_harness_dir.join(extra));
+                    }
+                }
             }
             for sub in [
                 "conversations",
@@ -851,6 +890,11 @@ pub fn stage_remote_harness_index(
             if let Ok(listing) = run_remote_script(&probe.endpoint, &prep_script) {
                 for line in listing.lines() {
                     if let Some(pb) = line.strip_prefix("PB:") {
+                        if harness_subdir.starts_with("antigravity")
+                            && pb != "agyhub_summaries_proto.pb"
+                        {
+                            continue;
+                        }
                         pb_files.push(pb.to_string());
                     } else if let Some(rel) = line.strip_prefix("D:") {
                         let _ = fs::create_dir_all(staging_harness_dir.join(rel));
@@ -867,6 +911,10 @@ pub fn stage_remote_harness_index(
                 "conversation_summaries.db".to_string(),
                 "history.jsonl".to_string(),
             ];
+            if harness_subdir == "antigravity" {
+                files_to_pull.push("settings.json".to_string());
+                files_to_pull.push("antigravity_state.pbtxt".to_string());
+            }
             files_to_pull.extend(pb_files);
 
             if should_use_tar_transport() {
@@ -995,7 +1043,22 @@ pub fn push_staged_remote_harness_index(
     let remote_dir_str = probe.remote_harness_dir(harness_subdir);
 
     let mut staged_files = vec![staging_harness_dir.join("conversation_summaries.db")];
-    staged_files.extend(find_summary_pb_files(staging_harness_dir));
+    if harness_subdir.starts_with("antigravity") {
+        let agyhub = staging_harness_dir.join("agyhub_summaries_proto.pb");
+        if agyhub.exists() {
+            staged_files.push(agyhub);
+        }
+        if harness_subdir == "antigravity" {
+            for extra in ["settings.json", "antigravity_state.pbtxt"] {
+                let p = staging_harness_dir.join(extra);
+                if p.exists() {
+                    staged_files.push(p);
+                }
+            }
+        }
+    } else {
+        staged_files.extend(find_summary_pb_files(staging_harness_dir));
+    }
 
     match &probe.endpoint {
         RemoteEndpoint::LocalRoot { .. } => {

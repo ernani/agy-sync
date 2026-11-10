@@ -500,20 +500,29 @@ pub fn merge_project_manifest(
         }
 
         for s in &manifest.summaries {
-            let existing: Option<(i64, String)> = tx
+            let existing: Option<(i64, String, String)> = tx
                 .query_row(
-                    "SELECT step_count, last_modified_time FROM conversation_summaries WHERE conversation_id = ?1",
+                    "SELECT step_count, last_modified_time, title FROM conversation_summaries WHERE conversation_id = ?1",
                     params![&s.conversation_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        ))
+                    },
                 )
                 .optional()?;
 
             let should_upsert = match existing {
                 None => true,
-                Some((ex_steps, ex_time)) => {
+                Some((ex_steps, ex_time, ex_title)) => {
                     force
                         || s.step_count > ex_steps
                         || (s.step_count == ex_steps && s.last_modified_time >= ex_time)
+                        || (s.step_count == ex_steps
+                            && ex_title.trim().is_empty()
+                            && !s.title.trim().is_empty())
                 }
             };
 
@@ -529,8 +538,8 @@ pub fn merge_project_manifest(
                     last_user_input_time, app_data_dir, raw_summary
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                 ON CONFLICT(conversation_id) DO UPDATE SET
-                    title = excluded.title,
-                    preview = excluded.preview,
+                    title = CASE WHEN excluded.title != '' THEN excluded.title ELSE conversation_summaries.title END,
+                    preview = CASE WHEN excluded.preview != '' THEN excluded.preview ELSE conversation_summaries.preview END,
                     step_count = excluded.step_count,
                     last_modified_time = excluded.last_modified_time,
                     workspace_uris = excluded.workspace_uris,
@@ -617,7 +626,15 @@ pub fn merge_project_manifest(
 
     // Update `*_summaries_proto.pb` files in `harness_dir`
     if !manifest.protobuf_entries.is_empty() {
-        let mut target_pb_paths = find_summary_pb_files(harness_dir);
+        let is_antigravity_family = harness_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("antigravity"));
+        let mut target_pb_paths = if is_antigravity_family {
+            vec![harness_dir.join("agyhub_summaries_proto.pb")]
+        } else {
+            find_summary_pb_files(harness_dir)
+        };
         if target_pb_paths.is_empty() {
             if !manifest.protobuf_filenames.is_empty() {
                 for fname in &manifest.protobuf_filenames {
