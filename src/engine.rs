@@ -694,7 +694,13 @@ fn run_session_harness(
             .projects
             .get(&proj_key)
             .and_then(|p| p.sessions.get(cid))
-            .is_some_and(|s| s.present_on_local && s.present_on_remote);
+            .is_some_and(|s| {
+                s.present_on_local
+                    && s.present_on_remote
+                    && (s.remote_synced_harnesses.contains(kind.cli_id())
+                        || (s.remote_synced_harnesses.is_empty()
+                            && s.harnesses.contains(kind.cli_id())))
+            });
 
         let action = match config.mode {
             SyncMode::Push => {
