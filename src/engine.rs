@@ -1,3 +1,4 @@
+use crate::config::SyncStateLedger;
 use crate::discovery::{
     discover_project_sessions, hydrate_missing_counterpart_sessions, is_home_or_root_path,
     normalize_project_path, path_to_file_uri, ProjectDiscovery,
@@ -8,18 +9,19 @@ use crate::harnesses::{
 };
 use crate::index_merge::{
     export_project_manifest, find_sessions_with_home_prefix, home_search_needles,
-    merge_project_manifest, remap_conversation_artifacts, MergeStats,
+    merge_project_manifest, purge_sessions_from_harness, remap_conversation_artifacts, MergeStats,
 };
 use crate::transport::{
     ensure_sufficient_fd_limit, probe_remote, push_staged_remote_harness_index,
     reload_remote_agent_services_if_present, remote_checkpoint_or_clean_harness_wals,
-    rsync_harness_relative_paths, rsync_workspace_dir, stage_remote_gemini_metadata,
-    stage_remote_harness_index, RemoteEndpoint, RemoteProbe, RsyncTransferOpts,
+    remote_purge_sessions_and_workspace, rsync_harness_relative_paths, rsync_workspace_dir,
+    stage_remote_gemini_metadata, stage_remote_harness_index, RemoteEndpoint, RemoteProbe,
+    RsyncTransferOpts,
 };
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -522,9 +524,23 @@ fn run_session_harness(
     hydrate_missing_counterpart_sessions(&mut local_discovery, &all_cids);
     hydrate_missing_counterpart_sessions(&mut remote_discovery, &all_cids);
 
+    let local_gemini_root = config.local_gemini_root();
+    let mut ledger = SyncStateLedger::load(&local_gemini_root);
+    let proj_key = SyncStateLedger::canonical_project_key(norm_project);
+    let is_tty = io::stdin().is_terminal();
+
+    let mut local_purge_cids = BTreeSet::new();
+    let mut remote_purge_cids = BTreeSet::new();
+
     for cid in &all_cids {
         let l_opt = local_discovery.sessions.get(cid);
         let r_opt = remote_discovery.sessions.get(cid);
+
+        let previously_synced_both = ledger
+            .projects
+            .get(&proj_key)
+            .and_then(|p| p.sessions.get(cid))
+            .is_some_and(|s| s.present_on_local && s.present_on_remote);
 
         let action = match config.mode {
             SyncMode::Push => {
@@ -541,9 +557,87 @@ fn run_session_harness(
                     continue;
                 }
             }
-            SyncMode::Inspect | SyncMode::Sync => match (l_opt, r_opt) {
+            SyncMode::Inspect => match (l_opt, r_opt) {
                 (Some(_), None) => SessionAction::PushToRemote,
                 (None, Some(_)) => SessionAction::PullToLocal,
+                (Some(l), Some(r)) => {
+                    if l.step_count > r.step_count
+                        || (l.step_count == r.step_count
+                            && l.last_modified_time > r.last_modified_time)
+                    {
+                        SessionAction::PushToRemote
+                    } else if r.step_count > l.step_count
+                        || (r.step_count == l.step_count
+                            && r.last_modified_time > l.last_modified_time)
+                    {
+                        SessionAction::PullToLocal
+                    } else {
+                        SessionAction::InSyncDeltaCheck
+                    }
+                }
+                (None, None) => unreachable!(),
+            },
+            SyncMode::Sync => match (l_opt, r_opt) {
+                (Some(l), None) => {
+                    if previously_synced_both && is_tty {
+                        print!(
+                            "  [?] Conversation '{}' ({}, {} steps) was previously synced, \
+                             but is now deleted on Remote.\n      \
+                             -> [d] Delete from Local as well, [r] Restore (push) to Remote, [s] Skip [default: s]: ",
+                            if l.title.is_empty() {
+                                "(Untitled)"
+                            } else {
+                                &l.title
+                            },
+                            cid,
+                            l.step_count
+                        );
+                        let _ = io::stdout().flush();
+                        let mut line = String::new();
+                        let _ = io::stdin().lock().read_line(&mut line);
+                        match line.trim().to_ascii_lowercase().as_str() {
+                            "d" | "delete" => {
+                                local_purge_cids.insert(cid.clone());
+                                ledger.remove_session(norm_project, cid);
+                                continue;
+                            }
+                            "r" | "restore" => SessionAction::PushToRemote,
+                            _ => continue,
+                        }
+                    } else {
+                        SessionAction::PushToRemote
+                    }
+                }
+                (None, Some(r)) => {
+                    if previously_synced_both && is_tty {
+                        print!(
+                            "  [?] Conversation '{}' ({}, {} steps) previously existed on Local, \
+                             but was deleted locally.\n      \
+                             -> [d] Delete from Remote as well, [r] Restore (pull) to Local, [s] Skip [default: s]: ",
+                            if r.title.is_empty() {
+                                "(Untitled)"
+                            } else {
+                                &r.title
+                            },
+                            cid,
+                            r.step_count
+                        );
+                        let _ = io::stdout().flush();
+                        let mut line = String::new();
+                        let _ = io::stdin().lock().read_line(&mut line);
+                        match line.trim().to_ascii_lowercase().as_str() {
+                            "d" | "delete" => {
+                                remote_purge_cids.insert(cid.clone());
+                                ledger.remove_session(norm_project, cid);
+                                continue;
+                            }
+                            "r" | "restore" => SessionAction::PullToLocal,
+                            _ => continue,
+                        }
+                    } else {
+                        SessionAction::PullToLocal
+                    }
+                }
                 (Some(l), Some(r)) => {
                     if l.step_count > r.step_count
                         || (l.step_count == r.step_count
@@ -930,6 +1024,61 @@ fn run_session_harness(
         }
 
         let _ = reload_remote_agent_services_if_present(&probe.endpoint);
+    }
+
+    if !local_purge_cids.is_empty() {
+        log_substep(&format!(
+            "Purging {} deleted session(s) from local harness '{}' ...",
+            local_purge_cids.len(),
+            kind.cli_id()
+        ));
+        let _ = purge_sessions_from_harness(&local_harness_dir, &local_purge_cids, config.dry_run);
+    }
+    if !remote_purge_cids.is_empty() {
+        log_substep(&format!(
+            "Purging {} deleted session(s) from remote harness '{}' ...",
+            remote_purge_cids.len(),
+            kind.cli_id()
+        ));
+        let _ = remote_purge_sessions_and_workspace(
+            probe,
+            subdir,
+            &staging_remote_harness,
+            &remote_purge_cids,
+            false,
+            config.dry_run,
+        );
+    }
+
+    if !config.dry_run {
+        for cid in &all_cids {
+            if local_purge_cids.contains(cid) || remote_purge_cids.contains(cid) {
+                continue;
+            }
+            let l_opt = local_discovery.sessions.get(cid);
+            let r_opt = remote_discovery.sessions.get(cid);
+            let sess_ref = l_opt.or(r_opt);
+            if let Some(s) = sess_ref {
+                let max_steps = l_opt
+                    .map(|x| x.step_count)
+                    .unwrap_or(0)
+                    .max(r_opt.map(|x| x.step_count).unwrap_or(0));
+                let on_local = l_opt.is_some() || pulled_cids.contains(cid);
+                let on_remote = r_opt.is_some() || pushed_cids.contains(cid);
+                ledger.record_session(
+                    norm_project,
+                    &probe.remote_project_path,
+                    kind.cli_id(),
+                    cid,
+                    &s.title,
+                    max_steps,
+                    &s.parent_conversation_id,
+                    on_local,
+                    on_remote,
+                );
+            }
+        }
+        let _ = ledger.save(&local_gemini_root);
     }
 
     Ok(HarnessSyncReport {

@@ -1,18 +1,21 @@
 use agy_sync::config::{
-    config_file_path, detect_port_in_ssh_config, resolve_local_home, AgySyncConfig,
+    config_file_path, detect_port_in_ssh_config, resolve_local_home, AgySyncConfig, SyncStateLedger,
 };
-use agy_sync::discovery::{is_home_or_root_path, normalize_project_path};
+use agy_sync::discovery::{discover_project_sessions, is_home_or_root_path, normalize_project_path};
 use agy_sync::engine::{print_report, run_engine, EngineConfig, SyncMode};
 use agy_sync::harnesses::{discover_harnesses, HarnessKind};
-use agy_sync::interactive::run_interactive_wizard;
+use agy_sync::index_merge::purge_sessions_from_harness;
+use agy_sync::interactive::{run_interactive_migration_wizard, run_interactive_wizard};
 use agy_sync::transport::{
-    ensure_sufficient_fd_limit, probe_remote, run_remote_script, shell_quote, RemoteEndpoint,
+    ensure_sufficient_fd_limit, probe_remote, remote_purge_sessions_and_workspace,
+    run_remote_script, shell_quote, stage_remote_harness_index, RemoteEndpoint,
 };
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
@@ -95,6 +98,15 @@ enum Commands {
     Push,
     /// Unidirectional pull (Remote -> Local) for the project folder and selected harnesses
     Pull,
+    /// Interactive step-by-step wizard to migrate or coexist projects & sessions across local `~/.gemini` harnesses
+    Migrate {
+        /// Optional source harness name (`agy-2.0`, `agy-cli`, or custom session subdir)
+        #[arg(long)]
+        from: Option<String>,
+        /// Optional target harness name (`agy-2.0`, `agy-cli`, or custom session subdir)
+        #[arg(long)]
+        to: Option<String>,
+    },
     /// View or update persistent defaults stored in `$HOME/.config/.agy-sync`
     Config {
         /// Display current configuration in `$HOME/.config/.agy-sync`
@@ -351,6 +363,7 @@ fn main() -> Result<()> {
         Commands::Sync => SyncMode::Sync,
         Commands::Push => SyncMode::Push,
         Commands::Pull => SyncMode::Pull,
+        Commands::Migrate { .. } => SyncMode::Sync,
         Commands::Config { .. } => unreachable!(),
     };
 
@@ -368,6 +381,10 @@ fn main() -> Result<()> {
         include_build_dirs: cli.include_build_dirs,
         extra_excludes: cli.exclude,
     };
+
+    if let Some(Commands::Migrate { from, to }) = cli.command {
+        return run_interactive_migration_wizard(&base_config, from, to);
+    }
 
     if cli.interactive {
         return run_interactive_wizard(base_config, cli.remote);
@@ -392,7 +409,7 @@ fn main() -> Result<()> {
             cli.user,
             &local_home,
         )?),
-        Commands::Config { .. } => unreachable!(),
+        Commands::Migrate { .. } | Commands::Config { .. } => unreachable!(),
     };
     base_config.endpoint = endpoint;
 
@@ -409,6 +426,9 @@ fn main() -> Result<()> {
             norm_container.display(),
             children.len()
         );
+        let is_tty = io::stdin().is_terminal();
+        let mut ledger = SyncStateLedger::load(&local_gemini_root);
+
         for (idx, child_name) in children.iter().enumerate() {
             let child_path = norm_container.join(child_name);
             println!(
@@ -418,6 +438,144 @@ fn main() -> Result<()> {
                 child_name,
                 child_path.display()
             );
+
+            // Check if this child project previously existed on both Local and Remote in the ledger
+            // and was deleted on one side.
+            if mode == SyncMode::Sync && is_tty {
+                let p_key = SyncStateLedger::canonical_project_key(&child_path);
+                let prev_both = ledger
+                    .projects
+                    .get(&p_key)
+                    .is_some_and(|p| p.present_on_local && p.present_on_remote);
+                if prev_both {
+                    let local_exists = child_path.exists();
+                    let remote_exists = if let Some(ref ep) = base_config.endpoint {
+                        if let Ok(pr) = probe_remote(ep, &local_home, &child_path) {
+                            match ep {
+                                RemoteEndpoint::LocalRoot { .. } => {
+                                    Path::new(&pr.remote_project_path).exists()
+                                }
+                                RemoteEndpoint::Ssh { .. } => {
+                                    let s =
+                                        format!("test -d {}", shell_quote(&pr.remote_project_path));
+                                    run_remote_script(ep, &s).is_ok()
+                                }
+                            }
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    };
+
+                    if !local_exists && remote_exists {
+                        print!(
+                            "  [?] Project '{}' previously existed on both Local and Remote, \
+                             but its local folder was deleted.\n      \
+                             -> [d] Delete project & sessions from Remote as well, [r] Restore from Remote, [s] Skip [default: s]: ",
+                            child_name
+                        );
+                        let _ = io::stdout().flush();
+                        let mut line = String::new();
+                        let _ = io::stdin().lock().read_line(&mut line);
+                        match line.trim().to_ascii_lowercase().as_str() {
+                            "d" | "delete" => {
+                                if let Some(ref ep) = base_config.endpoint {
+                                    if let Ok(pr) = probe_remote(ep, &local_home, &child_path) {
+                                        let tmp = tempfile::TempDir::new()?;
+                                        for hk in resolve_harnesses(
+                                            &cli.harness,
+                                            &child_path,
+                                            &local_gemini_root,
+                                        )? {
+                                            if let Some(sub) = hk.session_subdir() {
+                                                let stg = tmp.path().join(sub);
+                                                let _ = stage_remote_harness_index(&pr, sub, &stg);
+                                                if let Ok(r_disc) = discover_project_sessions(
+                                                    Path::new(&pr.remote_project_path),
+                                                    &stg,
+                                                ) {
+                                                    let cids: BTreeSet<String> =
+                                                        r_disc.sessions.keys().cloned().collect();
+                                                    let _ = remote_purge_sessions_and_workspace(
+                                                        &pr,
+                                                        sub,
+                                                        &stg,
+                                                        &cids,
+                                                        true,
+                                                        base_config.dry_run,
+                                                    );
+                                                }
+                                                let l_dir = base_config.local_dir_for_harness(&hk);
+                                                if let Ok(l_disc) =
+                                                    discover_project_sessions(&child_path, &l_dir)
+                                                {
+                                                    let l_cids: BTreeSet<String> =
+                                                        l_disc.sessions.keys().cloned().collect();
+                                                    let _ = purge_sessions_from_harness(
+                                                        &l_dir,
+                                                        &l_cids,
+                                                        base_config.dry_run,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if !base_config.dry_run {
+                                    ledger.remove_project(&child_path);
+                                    let _ = ledger.save(&local_gemini_root);
+                                }
+                                continue;
+                            }
+                            "r" | "restore" => {}
+                            _ => continue,
+                        }
+                    } else if local_exists && !remote_exists {
+                        print!(
+                            "  [?] Project '{}' previously existed on both Local and Remote, \
+                             but its remote folder was deleted.\n      \
+                             -> [d] Delete project & sessions from Local as well, [r] Restore (push) to Remote, [s] Skip [default: s]: ",
+                            child_name
+                        );
+                        let _ = io::stdout().flush();
+                        let mut line = String::new();
+                        let _ = io::stdin().lock().read_line(&mut line);
+                        match line.trim().to_ascii_lowercase().as_str() {
+                            "d" | "delete" => {
+                                for hk in
+                                    resolve_harnesses(&cli.harness, &child_path, &local_gemini_root)?
+                                {
+                                    if hk.session_subdir().is_some() {
+                                        let l_dir = base_config.local_dir_for_harness(&hk);
+                                        if let Ok(l_disc) =
+                                            discover_project_sessions(&child_path, &l_dir)
+                                        {
+                                            let l_cids: BTreeSet<String> =
+                                                l_disc.sessions.keys().cloned().collect();
+                                            let _ = purge_sessions_from_harness(
+                                                &l_dir,
+                                                &l_cids,
+                                                base_config.dry_run,
+                                            );
+                                        }
+                                    }
+                                }
+                                if !base_config.dry_run && child_path.exists() {
+                                    let _ = fs::remove_dir_all(&child_path);
+                                    println!("  [removed dir] {}", child_path.display());
+                                    ledger.remove_project(&child_path);
+                                    let _ = ledger.save(&local_gemini_root);
+                                }
+                                continue;
+                            }
+                            "r" | "restore" => {}
+                            _ => continue,
+                        }
+                    }
+                }
+            }
+
             let mut child_cfg = base_config.clone();
             child_cfg.project_path = child_path.clone();
             child_cfg.selected_harnesses =

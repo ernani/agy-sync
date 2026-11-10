@@ -1,10 +1,16 @@
-use crate::config::{detect_port_in_ssh_config, AgySyncConfig};
-use crate::discovery::normalize_project_path;
+use crate::config::{detect_port_in_ssh_config, AgySyncConfig, SyncStateLedger};
+use crate::discovery::{discover_project_sessions, normalize_project_path};
 use crate::engine::{format_bytes, print_report, run_engine, EngineConfig, SyncMode};
-use crate::harnesses::{discover_harnesses, HarnessKind};
+use crate::harnesses::{
+    compare_workspace_equality, discover_all_projects_in_harness, discover_harnesses,
+    migrate_project_between_local_harnesses, HarnessKind, PlacementMode,
+};
+use crate::index_merge::purge_sessions_from_harness;
 use crate::transport::{authenticate_ssh_interactive, check_ssh_auth, RemoteEndpoint};
 use anyhow::{bail, Result};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 
 fn prompt_line(prompt: &str) -> Result<String> {
     print!("{}", prompt);
@@ -345,5 +351,598 @@ pub fn run_interactive_wizard(
     let report = run_engine(&base_config)?;
     print_report(&report, &base_config);
 
+    println!();
+    let run_mig = prompt_yes_no(
+        " Would you also like to run the Cross-Harness Project Migration & Coexistence Wizard now? [y/N]: ",
+        false,
+    )?;
+    if run_mig {
+        run_interactive_migration_wizard(&base_config, None, None)?;
+    }
+
+    Ok(())
+}
+
+fn describe_session_comparison(
+    a_label: &str,
+    b_label: &str,
+    a_sessions: &BTreeMap<String, crate::discovery::DiscoveredSession>,
+    b_sessions: &BTreeMap<String, crate::discovery::DiscoveredSession>,
+) -> String {
+    let mut all_ids: BTreeSet<&String> = a_sessions.keys().collect();
+    all_ids.extend(b_sessions.keys());
+    if all_ids.is_empty() {
+        return "No sessions in either harness".to_string();
+    }
+    let mut equal = 0usize;
+    let mut a_ahead = 0usize;
+    let mut b_ahead = 0usize;
+    let mut only_a = 0usize;
+    let mut only_b = 0usize;
+
+    for id in all_ids {
+        match (a_sessions.get(id), b_sessions.get(id)) {
+            (Some(a), Some(b)) => {
+                if a.step_count > b.step_count {
+                    a_ahead += 1;
+                } else if b.step_count > a.step_count {
+                    b_ahead += 1;
+                } else {
+                    equal += 1;
+                }
+            }
+            (Some(_), None) => only_a += 1,
+            (None, Some(_)) => only_b += 1,
+            (None, None) => {}
+        }
+    }
+
+    if a_ahead == 0 && b_ahead == 0 && only_a == 0 && only_b == 0 {
+        format!("EQUAL ({} session(s) identical in both)", equal)
+    } else {
+        format!(
+            "equal={}, {} ahead={}, {} ahead={}, only in {}={}, only in {}={}",
+            equal, a_label, a_ahead, b_label, b_ahead, a_label, only_a, b_label, only_b
+        )
+    }
+}
+
+fn prompt_placement_mode(a_label: &str, b_label: &str) -> Result<PlacementMode> {
+    println!("      Select placement mode:");
+    println!(
+        "        [b] Coexist in BOTH ('{}' + '{}') [default]",
+        a_label, b_label
+    );
+    println!(
+        "        [1] Exist ONLY in '{}' (consolidate into '{}' & remove from '{}')",
+        a_label, a_label, b_label
+    );
+    println!(
+        "        [2] Exist ONLY in '{}' (consolidate into '{}' & remove from '{}')",
+        b_label, b_label, a_label
+    );
+    let choice = prompt_line("      -> Choice [b/1/2, default: b]: ")?;
+    match choice.to_ascii_lowercase().as_str() {
+        "1" => Ok(PlacementMode::OnlyInSource),
+        "2" => Ok(PlacementMode::OnlyInTarget),
+        _ => Ok(PlacementMode::CoexistInBoth),
+    }
+}
+
+/// Runs the two-pass step-by-step interactive wizard to migrate or bridge projects between two local
+/// session harnesses (`Pass 1: Harness A -> Harness B`, `Pass 2: Harness B -> Harness A` counterpart),
+/// followed by `Pass 3: Deleted / Ghost Project & Session Cleanup`.
+pub fn run_interactive_migration_wizard(
+    config: &EngineConfig,
+    from_harness_override: Option<String>,
+    to_harness_override: Option<String>,
+) -> Result<()> {
+    let gemini_root = config.local_gemini_root();
+    let available: Vec<HarnessKind> = HarnessKind::discover_available_kinds(&gemini_root)
+        .into_iter()
+        .filter(|k| k.session_subdir().is_some())
+        .collect();
+
+    if available.len() < 2 {
+        bail!(
+            "At least 2 session-based harnesses are required under {} to run cross-harness migration.",
+            gemini_root.display()
+        );
+    }
+
+    println!("================================================================================");
+    println!(
+        " Agy Interactive Cross-Harness Project Migration & Coexistence Wizard{}",
+        if config.dry_run { " (DRY-RUN)" } else { "" }
+    );
+    println!("================================================================================");
+    println!(" Available Session Harnesses in {}:", gemini_root.display());
+    for (idx, k) in available.iter().enumerate() {
+        println!(
+            "  [{}] {:<18} ({})",
+            idx + 1,
+            k.cli_id(),
+            k.display_path()
+        );
+    }
+    println!("--------------------------------------------------------------------------------");
+
+    let default_a_idx = 0usize;
+    let default_b_idx = available
+        .iter()
+        .position(|k| *k == HarnessKind::AgyCli)
+        .filter(|&i| i != default_a_idx)
+        .unwrap_or(1);
+
+    let harness_a = if let Some(ref raw_a) = from_harness_override {
+        HarnessKind::from_cli_id(raw_a)
+            .ok_or_else(|| anyhow::anyhow!("Invalid --from harness '{}'", raw_a))?
+    } else {
+        let input = prompt_line(&format!(
+            " Select Primary Harness A (number or name) [default: {} ({})]: ",
+            default_a_idx + 1,
+            available[default_a_idx].cli_id()
+        ))?;
+        if input.is_empty() {
+            available[default_a_idx].clone()
+        } else if let Ok(n) = input.parse::<usize>() {
+            if n >= 1 && n <= available.len() {
+                available[n - 1].clone()
+            } else {
+                bail!("Invalid harness index {}", n);
+            }
+        } else {
+            HarnessKind::from_cli_id(&input)
+                .ok_or_else(|| anyhow::anyhow!("Unknown harness '{}'", input))?
+        }
+    };
+
+    let harness_b = if let Some(ref raw_b) = to_harness_override {
+        HarnessKind::from_cli_id(raw_b)
+            .ok_or_else(|| anyhow::anyhow!("Invalid --to harness '{}'", raw_b))?
+    } else {
+        let fallback_b = if available[default_b_idx] == harness_a {
+            available.iter().find(|k| **k != harness_a).unwrap().clone()
+        } else {
+            available[default_b_idx].clone()
+        };
+        let input = prompt_line(&format!(
+            " Select Counterpart Harness B (number or name) [default: {}]: ",
+            fallback_b.cli_id()
+        ))?;
+        if input.is_empty() {
+            fallback_b
+        } else if let Ok(n) = input.parse::<usize>() {
+            if n >= 1 && n <= available.len() {
+                available[n - 1].clone()
+            } else {
+                bail!("Invalid harness index {}", n);
+            }
+        } else {
+            HarnessKind::from_cli_id(&input)
+                .ok_or_else(|| anyhow::anyhow!("Unknown harness '{}'", input))?
+        }
+    };
+
+    if harness_a == harness_b {
+        bail!("Harness A and Harness B must be distinct harnesses.");
+    }
+
+    let dir_a = config.local_dir_for_harness(&harness_a);
+    let dir_b = config.local_dir_for_harness(&harness_b);
+    let label_a = harness_a.cli_id().to_string();
+    let label_b = harness_b.cli_id().to_string();
+
+    let projects_a = discover_all_projects_in_harness(&dir_a, &gemini_root, &config.local_home)?;
+    let projects_b = discover_all_projects_in_harness(&dir_b, &gemini_root, &config.local_home)?;
+
+    // Build basename lookup for counterpart matching across different parent folders
+    let mut b_by_basename: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for pb in &projects_b {
+        if let Some(name) = pb.file_name().and_then(|n| n.to_str()) {
+            b_by_basename.insert(name.to_string(), pb.clone());
+        }
+    }
+    let mut a_by_basename: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for pa in &projects_a {
+        if let Some(name) = pa.file_name().and_then(|n| n.to_str()) {
+            a_by_basename.insert(name.to_string(), pa.clone());
+        }
+    }
+
+    let mut handled_b_paths = BTreeSet::new();
+    let mut ledger = SyncStateLedger::load(&gemini_root);
+
+    // =========================================================================
+    // PASS 1: Harness A -> Harness B
+    // =========================================================================
+    println!("================================================================================");
+    println!(
+        " PASS 1/3: Bringing Projects from '{}' -> '{}' ({} project(s) found)",
+        label_a,
+        label_b,
+        projects_a.len()
+    );
+    println!("================================================================================");
+
+    for (idx, path_a) in projects_a.iter().enumerate() {
+        let proj_name = path_a
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("project");
+        let disc_a = discover_project_sessions(path_a, &dir_a)?;
+        if disc_a.sessions.is_empty() {
+            continue;
+        }
+
+        let counterpart_b_path = if projects_b.contains(path_a) {
+            Some(path_a.clone())
+        } else {
+            b_by_basename.get(proj_name).cloned()
+        };
+
+        let disc_b_opt = if let Some(ref pb) = counterpart_b_path {
+            handled_b_paths.insert(pb.clone());
+            Some(discover_project_sessions(pb, &dir_b)?)
+        } else {
+            let direct_b = discover_project_sessions(path_a, &dir_b)?;
+            if !direct_b.sessions.is_empty() {
+                Some(direct_b)
+            } else {
+                None
+            }
+        };
+
+        let total_steps_a: i64 = disc_a.sessions.values().map(|s| s.step_count).sum();
+        println!(
+            "\n [{}/{}] Project: {} ({})",
+            idx + 1,
+            projects_a.len(),
+            proj_name,
+            path_a.display()
+        );
+        println!(
+            "    • In '{}': {} session(s), {} total steps ({})",
+            label_a,
+            disc_a.sessions.len(),
+            total_steps_a,
+            format_bytes(disc_a.total_bytes)
+        );
+        if let Some(latest) = disc_a.latest_session() {
+            if !latest.title.is_empty() || !latest.last_prompt_snippet.is_empty() {
+                println!(
+                    "    • Latest in '{}': {} | \"{}\"",
+                    label_a,
+                    if latest.title.is_empty() {
+                        "(Untitled)"
+                    } else {
+                        &latest.title
+                    },
+                    latest.last_prompt_snippet
+                );
+            }
+        }
+
+        let target_proj_path = if let Some(ref disc_b) = disc_b_opt {
+            let pb = counterpart_b_path.as_ref().unwrap_or(path_a);
+            let ws_eq = compare_workspace_equality(path_a, pb);
+            let sess_eq =
+                describe_session_comparison(&label_a, &label_b, &disc_a.sessions, &disc_b.sessions);
+            println!("    • [SIMILAR / COEXISTING PROJECT DETECTED in '{}']", label_b);
+            println!("      - Workspace Equality: {}", ws_eq.summary_line());
+            println!("      - Session Equality  : {}", sess_eq);
+            pb.clone()
+        } else {
+            println!("    • In '{}': not present yet (0 sessions)", label_b);
+            path_a.clone()
+        };
+
+        let proceed = prompt_yes_no(
+            &format!(
+                "    -> Should project '{}' go from '{}' to '{}'? [y/N]: ",
+                proj_name, label_a, label_b
+            ),
+            false,
+        )?;
+        if !proceed {
+            continue;
+        }
+
+        let placement = prompt_placement_mode(&label_a, &label_b)?;
+        let chosen_dst_path = if path_a != &target_proj_path {
+            println!("      Two workspace paths exist for '{}':", proj_name);
+            println!("        [1] {} (from '{}')", path_a.display(), label_a);
+            println!(
+                "        [2] {} (from '{}')",
+                target_proj_path.display(),
+                label_b
+            );
+            let p_choice = prompt_line("      -> Choose canonical workspace path [1/2, default: 1]: ")?;
+            if p_choice.trim() == "2" {
+                target_proj_path
+            } else {
+                path_a.clone()
+            }
+        } else {
+            path_a.clone()
+        };
+
+        let (stats, purged) = migrate_project_between_local_harnesses(
+            &gemini_root,
+            &dir_a,
+            &dir_b,
+            path_a,
+            &chosen_dst_path,
+            placement,
+            config.deep_remap,
+            config.dry_run,
+        )?;
+        println!(
+            "      [OK] Applied {:?}: upserted={} (FTS={}, Protobuf={}), purged={}",
+            placement,
+            stats.summaries_upserted,
+            stats.fts_chunks_updated,
+            stats.protobuf_entries_updated,
+            purged
+        );
+
+        if !config.dry_run {
+            for (cid, s) in &disc_a.sessions {
+                if placement != PlacementMode::OnlyInTarget {
+                    ledger.record_session(
+                        &chosen_dst_path,
+                        "",
+                        &label_a,
+                        cid,
+                        &s.title,
+                        s.step_count,
+                        &s.parent_conversation_id,
+                        true,
+                        false,
+                    );
+                }
+                if placement != PlacementMode::OnlyInSource {
+                    ledger.record_session(
+                        &chosen_dst_path,
+                        "",
+                        &label_b,
+                        cid,
+                        &s.title,
+                        s.step_count,
+                        &s.parent_conversation_id,
+                        true,
+                        false,
+                    );
+                }
+            }
+            let _ = ledger.save(&gemini_root);
+        }
+    }
+
+    // =========================================================================
+    // PASS 2: Counterpart Harness B -> Harness A
+    // =========================================================================
+    let remaining_b: Vec<PathBuf> = projects_b
+        .into_iter()
+        .filter(|p| !handled_b_paths.contains(p))
+        .collect();
+
+    println!("\n================================================================================");
+    println!(
+        " PASS 2/3 (Counterpart): Bringing Projects from '{}' -> '{}' ({} remaining project(s))",
+        label_b,
+        label_a,
+        remaining_b.len()
+    );
+    println!("================================================================================");
+
+    for (idx, path_b) in remaining_b.iter().enumerate() {
+        let proj_name = path_b
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("project");
+        let disc_b = discover_project_sessions(path_b, &dir_b)?;
+        if disc_b.sessions.is_empty() {
+            continue;
+        }
+
+        let counterpart_a_path = if projects_a.contains(path_b) {
+            Some(path_b.clone())
+        } else {
+            a_by_basename.get(proj_name).cloned()
+        };
+
+        let total_steps_b: i64 = disc_b.sessions.values().map(|s| s.step_count).sum();
+        println!(
+            "\n [{}/{}] Project: {} ({})",
+            idx + 1,
+            remaining_b.len(),
+            proj_name,
+            path_b.display()
+        );
+        println!(
+            "    • In '{}': {} session(s), {} total steps ({})",
+            label_b,
+            disc_b.sessions.len(),
+            total_steps_b,
+            format_bytes(disc_b.total_bytes)
+        );
+        if let Some(latest) = disc_b.latest_session() {
+            if !latest.title.is_empty() || !latest.last_prompt_snippet.is_empty() {
+                println!(
+                    "    • Latest in '{}': {} | \"{}\"",
+                    label_b,
+                    if latest.title.is_empty() {
+                        "(Untitled)"
+                    } else {
+                        &latest.title
+                    },
+                    latest.last_prompt_snippet
+                );
+            }
+        }
+
+        let target_proj_path = if let Some(ref pa) = counterpart_a_path {
+            let disc_a = discover_project_sessions(pa, &dir_a)?;
+            let ws_eq = compare_workspace_equality(path_b, pa);
+            let sess_eq =
+                describe_session_comparison(&label_b, &label_a, &disc_b.sessions, &disc_a.sessions);
+            println!("    • [SIMILAR / COEXISTING PROJECT DETECTED in '{}']", label_a);
+            println!("      - Workspace Equality: {}", ws_eq.summary_line());
+            println!("      - Session Equality  : {}", sess_eq);
+            pa.clone()
+        } else {
+            println!("    • In '{}': not present yet (0 sessions)", label_a);
+            path_b.clone()
+        };
+
+        let proceed = prompt_yes_no(
+            &format!(
+                "    -> Should project '{}' go from '{}' to '{}'? [y/N]: ",
+                proj_name, label_b, label_a
+            ),
+            false,
+        )?;
+        if !proceed {
+            continue;
+        }
+
+        let placement = prompt_placement_mode(&label_b, &label_a)?;
+        let chosen_dst_path = if path_b != &target_proj_path {
+            println!("      Two workspace paths exist for '{}':", proj_name);
+            println!("        [1] {} (from '{}')", path_b.display(), label_b);
+            println!(
+                "        [2] {} (from '{}')",
+                target_proj_path.display(),
+                label_a
+            );
+            let p_choice = prompt_line("      -> Choose canonical workspace path [1/2, default: 2]: ")?;
+            if p_choice.trim() == "1" {
+                path_b.clone()
+            } else {
+                target_proj_path
+            }
+        } else {
+            path_b.clone()
+        };
+
+        let (stats, purged) = migrate_project_between_local_harnesses(
+            &gemini_root,
+            &dir_b,
+            &dir_a,
+            path_b,
+            &chosen_dst_path,
+            placement,
+            config.deep_remap,
+            config.dry_run,
+        )?;
+        println!(
+            "      [OK] Applied {:?}: upserted={} (FTS={}, Protobuf={}), purged={}",
+            placement,
+            stats.summaries_upserted,
+            stats.fts_chunks_updated,
+            stats.protobuf_entries_updated,
+            purged
+        );
+
+        if !config.dry_run {
+            for (cid, s) in &disc_b.sessions {
+                if placement != PlacementMode::OnlyInTarget {
+                    ledger.record_session(
+                        &chosen_dst_path,
+                        "",
+                        &label_b,
+                        cid,
+                        &s.title,
+                        s.step_count,
+                        &s.parent_conversation_id,
+                        true,
+                        false,
+                    );
+                }
+                if placement != PlacementMode::OnlyInSource {
+                    ledger.record_session(
+                        &chosen_dst_path,
+                        "",
+                        &label_a,
+                        cid,
+                        &s.title,
+                        s.step_count,
+                        &s.parent_conversation_id,
+                        true,
+                        false,
+                    );
+                }
+            }
+            let _ = ledger.save(&gemini_root);
+        }
+    }
+
+    // =========================================================================
+    // PASS 3: Deleted / Ghost Project & Conversation Cleanup
+    // =========================================================================
+    println!("\n================================================================================");
+    println!(" PASS 3/3: Deleted / Ghost Project & Conversation Reconciliation");
+    println!("================================================================================");
+
+    let mut all_discovered_paths = projects_a.clone();
+    all_discovered_paths.extend(remaining_b);
+
+    let mut ghost_candidates = Vec::new();
+    for p in &all_discovered_paths {
+        if !p.exists() {
+            ghost_candidates.push(p.clone());
+        }
+    }
+
+    if ghost_candidates.is_empty() {
+        println!("  [OK] All discovered project workspace folders exist on disk.");
+    } else {
+        println!(
+            "  Found {} deleted workspace folder(s) that still have leftover sessions:",
+            ghost_candidates.len()
+        );
+        for gp in ghost_candidates {
+            let da = discover_project_sessions(&gp, &dir_a)?;
+            let db = discover_project_sessions(&gp, &dir_b)?;
+            let count_a = da.sessions.len();
+            let count_b = db.sessions.len();
+            if count_a == 0 && count_b == 0 {
+                continue;
+            }
+            println!(
+                "\n  • Deleted Workspace: {} ('{}': {} session(s), '{}': {} session(s))",
+                gp.display(),
+                label_a,
+                count_a,
+                label_b,
+                count_b
+            );
+            let del = prompt_yes_no(
+                "    -> Delete these leftover sessions from local harnesses? [y/N]: ",
+                false,
+            )?;
+            if del {
+                if count_a > 0 {
+                    let cids: BTreeSet<String> = da.sessions.keys().cloned().collect();
+                    let n = purge_sessions_from_harness(&dir_a, &cids, config.dry_run)?;
+                    println!("      [OK] Purged {} session(s) from '{}'.", n, label_a);
+                }
+                if count_b > 0 {
+                    let cids: BTreeSet<String> = db.sessions.keys().cloned().collect();
+                    let n = purge_sessions_from_harness(&dir_b, &cids, config.dry_run)?;
+                    println!("      [OK] Purged {} session(s) from '{}'.", n, label_b);
+                }
+                if !config.dry_run {
+                    ledger.remove_project(&gp);
+                    let _ = ledger.save(&gemini_root);
+                }
+            }
+        }
+    }
+
+    println!("================================================================================");
+    println!(" Cross-Harness Migration & Coexistence Wizard Complete.");
+    println!("================================================================================");
     Ok(())
 }

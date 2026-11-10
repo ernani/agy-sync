@@ -1379,6 +1379,88 @@ pub fn reload_remote_agent_services_if_present(endpoint: &RemoteEndpoint) -> Res
     Ok(())
 }
 
+/// Purges specific `conversation_ids` from a remote harness directory (and optionally deletes the
+/// remote project workspace directory when `delete_workspace` is true).
+pub fn remote_purge_sessions_and_workspace(
+    probe: &RemoteProbe,
+    harness_subdir: &str,
+    staging_harness_dir: &Path,
+    conversation_ids: &BTreeSet<String>,
+    delete_workspace: bool,
+    dry_run: bool,
+) -> Result<()> {
+    if dry_run {
+        return Ok(());
+    }
+    let remote_dir_str = probe.remote_harness_dir(harness_subdir);
+
+    match &probe.endpoint {
+        RemoteEndpoint::LocalRoot { .. } => {
+            let remote_dir = Path::new(&remote_dir_str);
+            if !conversation_ids.is_empty() && remote_dir.exists() {
+                let _ = crate::index_merge::purge_sessions_from_harness(
+                    remote_dir,
+                    conversation_ids,
+                    false,
+                );
+            }
+            if delete_workspace {
+                let ws_path = Path::new(&probe.remote_project_path);
+                if ws_path.exists()
+                    && !crate::discovery::is_home_or_root_path(ws_path, &probe.remote_home)
+                {
+                    let _ = fs::remove_dir_all(ws_path);
+                }
+            }
+        }
+        RemoteEndpoint::Ssh { .. } => {
+            if !conversation_ids.is_empty() {
+                if staging_harness_dir.exists() {
+                    let _ = crate::index_merge::purge_sessions_from_harness(
+                        staging_harness_dir,
+                        conversation_ids,
+                        false,
+                    );
+                    let _ = push_staged_remote_harness_index(
+                        probe,
+                        harness_subdir,
+                        staging_harness_dir,
+                        false,
+                    );
+                }
+                let r_dir = shell_quote(&remote_dir_str);
+                let mut rm_targets = Vec::new();
+                for cid in conversation_ids {
+                    if !crate::discovery::is_uuid(cid) {
+                        continue;
+                    }
+                    rm_targets.push(format!(
+                        "{rj}/conversations/{cid}.db {rj}/conversations/{cid}.db-wal {rj}/conversations/{cid}.db-shm \
+                         {rj}/brain/{cid} {rj}/annotations/{cid}.pbtxt {rj}/implicit/{cid}.pb \
+                         {rj}/context_state/{cid}.pb {rj}/browser_recordings/{cid} {rj}/html_artifacts/{cid}",
+                        rj = r_dir,
+                        cid = cid
+                    ));
+                }
+                if !rm_targets.is_empty() {
+                    let script = format!("rm -rfv {} || true", rm_targets.join(" "));
+                    let _ = run_remote_script(&probe.endpoint, &script);
+                }
+            }
+            if delete_workspace {
+                let ws_path = Path::new(&probe.remote_project_path);
+                if !crate::discovery::is_home_or_root_path(ws_path, &probe.remote_home) {
+                    let script =
+                        format!("rm -rfv {} || true", shell_quote(&probe.remote_project_path));
+                    let _ = run_remote_script(&probe.endpoint, &script);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

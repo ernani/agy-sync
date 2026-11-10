@@ -482,6 +482,11 @@ pub fn merge_project_manifest(
     ensure_summary_db_schema(&conn)?;
 
     let mut updated_cids = BTreeSet::new();
+    let target_app_data_dir = harness_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
 
     {
         let tx = conn.transaction()?;
@@ -521,8 +526,8 @@ pub fn merge_project_manifest(
                 "INSERT INTO conversation_summaries (
                     conversation_id, title, preview, step_count, last_modified_time,
                     workspace_uris, status, agent_name, parent_conversation_id, project_id,
-                    last_user_input_time, raw_summary
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                    last_user_input_time, app_data_dir, raw_summary
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                 ON CONFLICT(conversation_id) DO UPDATE SET
                     title = excluded.title,
                     preview = excluded.preview,
@@ -534,6 +539,7 @@ pub fn merge_project_manifest(
                     parent_conversation_id = excluded.parent_conversation_id,
                     project_id = excluded.project_id,
                     last_user_input_time = excluded.last_user_input_time,
+                    app_data_dir = excluded.app_data_dir,
                     raw_summary = excluded.raw_summary",
                 params![
                     &s.conversation_id,
@@ -547,6 +553,7 @@ pub fn merge_project_manifest(
                     &s.parent_conversation_id,
                     &s.project_id,
                     &s.last_user_input_time,
+                    &target_app_data_dir,
                     &s.raw_summary,
                 ],
             )?;
@@ -849,6 +856,253 @@ fn remap_single_conversation_db(
 
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     Ok(())
+}
+
+/// Applies arbitrary `(from_str, to_str)` replacement pairs (such as workspace path relocation
+/// `old_project_path -> new_project_path` and harness subdir `/.gemini/<src> -> /.gemini/<dst>`)
+/// to all summaries, FTS chunks, and Protobuf entries in `manifest`.
+pub fn remap_manifest_custom_strings(
+    manifest: &mut ProjectIndexManifest,
+    replacements: &[(String, String)],
+) {
+    let valid_pairs: Vec<&(String, String)> = replacements
+        .iter()
+        .filter(|(f, t)| !f.is_empty() && f != t)
+        .collect();
+    if valid_pairs.is_empty() {
+        return;
+    }
+
+    for s_row in &mut manifest.summaries {
+        for (f, t) in &valid_pairs {
+            if s_row.workspace_uris.contains(f) {
+                s_row.workspace_uris = s_row.workspace_uris.replace(f, t);
+            }
+            if s_row.preview.contains(f) {
+                s_row.preview = s_row.preview.replace(f, t);
+            }
+            if !s_row.raw_summary.is_empty() {
+                if let Ok(rewritten) = rewrite_protobuf_strings(&s_row.raw_summary, f, t) {
+                    s_row.raw_summary = rewritten;
+                }
+            }
+        }
+    }
+
+    for c_row in &mut manifest.fts_chunks {
+        for (f, t) in &valid_pairs {
+            if c_row.workspace.contains(f) {
+                c_row.workspace = c_row.workspace.replace(f, t);
+            }
+            if c_row.user_body.contains(f) {
+                c_row.user_body = c_row.user_body.replace(f, t);
+            }
+            if c_row.agent_body.contains(f) {
+                c_row.agent_body = c_row.agent_body.replace(f, t);
+            }
+        }
+    }
+
+    for raw_bytes in manifest.protobuf_entries.values_mut() {
+        for (f, t) in &valid_pairs {
+            if let Ok(rewritten) = rewrite_protobuf_strings(raw_bytes, f, t) {
+                *raw_bytes = rewritten;
+            }
+        }
+    }
+}
+
+/// Applies arbitrary `(from_str, to_str)` replacement pairs to per-conversation artifacts on disk
+/// (`conversations/<cid>.db`, `implicit/<cid>.pb`, and top-level `brain/<cid>/*.{md,json}` artifacts).
+pub fn remap_conversation_artifacts_custom(
+    harness_dir: &Path,
+    conversation_ids: &BTreeSet<String>,
+    replacements: &[(String, String)],
+    deep_remap: bool,
+) -> Result<()> {
+    let valid_pairs: Vec<&(String, String)> = replacements
+        .iter()
+        .filter(|(f, t)| !f.is_empty() && f != t)
+        .collect();
+    if valid_pairs.is_empty() {
+        return Ok(());
+    }
+
+    for cid in conversation_ids {
+        let conv_db_path = harness_dir.join("conversations").join(format!("{}.db", cid));
+        if conv_db_path.exists() {
+            for (f, t) in &valid_pairs {
+                remap_single_conversation_db(&conv_db_path, f, t, deep_remap)?;
+            }
+        }
+
+        let implicit_path = harness_dir.join("implicit").join(format!("{}.pb", cid));
+        if implicit_path.exists() {
+            if let Ok(mut bytes) = fs::read(&implicit_path) {
+                let mut changed = false;
+                for (f, t) in &valid_pairs {
+                    if let Ok(rewritten) = rewrite_protobuf_strings(&bytes, f, t) {
+                        if rewritten != bytes {
+                            bytes = rewritten;
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    fs::write(&implicit_path, bytes)?;
+                }
+            }
+        }
+
+        let brain_dir = harness_dir.join("brain").join(cid);
+        if brain_dir.is_dir() {
+            if let Ok(entries) = fs::read_dir(&brain_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if !p.is_file() {
+                        continue;
+                    }
+                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    if matches!(ext, "md" | "json") {
+                        if let Ok(mut text) = fs::read_to_string(&p) {
+                            let mut changed = false;
+                            for (f, t) in &valid_pairs {
+                                if text.contains(f.as_str()) {
+                                    text = text.replace(f.as_str(), t.as_str());
+                                    changed = true;
+                                }
+                            }
+                            if changed {
+                                let _ = fs::write(&p, text);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Surgically purges `conversation_ids` from `harness_dir`:
+/// 1. Backs up `conversation_summaries.db` and `*_summaries_proto.pb` into `<harness_dir>/.sync_backups/latest/`.
+/// 2. Deletes rows from `conversation_summaries` and `conversations_fts`.
+/// 3. Removes entries from `*_summaries_proto.pb` and `history.jsonl`.
+/// 4. Verbose-removes per-conversation artifact files (`conversations/<cid>.db*`, `brain/<cid>`, etc.).
+pub fn purge_sessions_from_harness(
+    harness_dir: &Path,
+    conversation_ids: &BTreeSet<String>,
+    dry_run: bool,
+) -> Result<usize> {
+    if conversation_ids.is_empty() || !harness_dir.exists() {
+        return Ok(0);
+    }
+    if dry_run {
+        return Ok(conversation_ids.len());
+    }
+
+    backup_global_indexes(harness_dir)?;
+
+    let mut purged_count = 0usize;
+    let db_path = harness_dir.join("conversation_summaries.db");
+    if db_path.exists() {
+        let mut conn = Connection::open(&db_path)
+            .with_context(|| format!("Failed to open {}", db_path.display()))?;
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(5000));
+        let has_fts: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='conversations_fts'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+
+        let tx = conn.transaction()?;
+        for cid in conversation_ids {
+            let n = tx.execute(
+                "DELETE FROM conversation_summaries WHERE conversation_id = ?1",
+                params![cid],
+            )?;
+            purged_count += n;
+            if has_fts {
+                let _ = tx.execute(
+                    "DELETE FROM conversations_fts WHERE conversation_id = ?1",
+                    params![cid],
+                );
+            }
+        }
+        tx.commit()?;
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+
+    for pb_path in find_summary_pb_files(harness_dir) {
+        if let Ok(mut pb_map) = ProtobufSummariesMap::load_from_path(&pb_path) {
+            let mut modified = false;
+            for cid in conversation_ids {
+                if pb_map.remove(cid) {
+                    modified = true;
+                }
+            }
+            if modified {
+                let _ = pb_map.save_to_path(&pb_path);
+            }
+        }
+    }
+
+    let hist_path = harness_dir.join("history.jsonl");
+    if hist_path.exists() {
+        if let Ok(content) = fs::read_to_string(&hist_path) {
+            let mut kept_lines = Vec::new();
+            let mut changed = false;
+            for line in content.lines() {
+                let matches_cid = conversation_ids.iter().any(|cid| line.contains(cid));
+                if matches_cid {
+                    changed = true;
+                } else {
+                    kept_lines.push(line);
+                }
+            }
+            if changed {
+                let new_body = if kept_lines.is_empty() {
+                    String::new()
+                } else {
+                    kept_lines.join("\n") + "\n"
+                };
+                let _ = fs::write(&hist_path, new_body);
+            }
+        }
+    }
+
+    for cid in conversation_ids {
+        let candidate_files = [
+            format!("conversations/{}.db", cid),
+            format!("conversations/{}.db-wal", cid),
+            format!("conversations/{}.db-shm", cid),
+            format!("annotations/{}.pbtxt", cid),
+            format!("implicit/{}.pb", cid),
+            format!("context_state/{}.pb", cid),
+        ];
+        for rel in candidate_files {
+            let p = harness_dir.join(&rel);
+            if p.exists() && fs::remove_file(&p).is_ok() {
+                println!("  [removed] {}", p.display());
+            }
+        }
+        for dir_rel in [
+            format!("brain/{}", cid),
+            format!("browser_recordings/{}", cid),
+            format!("html_artifacts/{}", cid),
+        ] {
+            let d = harness_dir.join(&dir_rel);
+            if d.exists() && fs::remove_dir_all(&d).is_ok() {
+                println!("  [removed dir] {}", d.display());
+            }
+        }
+    }
+
+    Ok(purged_count.max(conversation_ids.len()))
 }
 
 #[cfg(test)]
