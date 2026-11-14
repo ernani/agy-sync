@@ -1,5 +1,8 @@
 use crate::discovery::find_summary_pb_files;
-use crate::protobuf::{rewrite_protobuf_strings, set_summary_project_id, ProtobufSummariesMap};
+use crate::protobuf::{
+    extract_protobuf_file_uris, rewrite_protobuf_strings, set_summary_project_id,
+    ProtobufSummariesMap,
+};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -393,7 +396,9 @@ pub fn export_project_manifest(
     // Also ensure any summary row with non-empty `raw_summary` populates `protobuf_entries` if missing
     for s_row in &manifest.summaries {
         if !s_row.raw_summary.is_empty()
-            && !manifest.protobuf_entries.contains_key(&s_row.conversation_id)
+            && !manifest
+                .protobuf_entries
+                .contains_key(&s_row.conversation_id)
         {
             manifest
                 .protobuf_entries
@@ -409,10 +414,7 @@ pub fn export_project_manifest(
 /// / `protobuf_entries` wire-format payloads.
 ///
 /// This ensures sessions appear grouped under the project workspace in Agy Web and IDEs.
-pub fn remap_manifest_project_ids(
-    manifest: &mut ProjectIndexManifest,
-    target_project_id: &str,
-) {
+pub fn remap_manifest_project_ids(manifest: &mut ProjectIndexManifest, target_project_id: &str) {
     if target_project_id.is_empty() {
         return;
     }
@@ -771,7 +773,9 @@ pub fn remap_conversation_artifacts(
     }
 
     for cid in conversation_ids {
-        let conv_db_path = harness_dir.join("conversations").join(format!("{}.db", cid));
+        let conv_db_path = harness_dir
+            .join("conversations")
+            .join(format!("{}.db", cid));
         if conv_db_path.exists() {
             remap_single_conversation_db(&conv_db_path, from_home, to_home, deep_remap)?;
         }
@@ -842,6 +846,35 @@ fn remap_single_conversation_db(
                 tx.execute(
                     "UPDATE trajectory_metadata_blob SET data = ?1 WHERE id = ?2",
                     params![rewritten, id],
+                )?;
+            }
+        }
+        tx.commit()?;
+    }
+
+    let has_exec_meta: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='executor_metadata'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+
+    if has_exec_meta {
+        let tx = conn.transaction()?;
+        let rows: Vec<(i64, Vec<u8>)> = {
+            let mut stmt = tx.prepare("SELECT idx, data FROM executor_metadata")?;
+            let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            mapped.flatten().collect()
+        };
+
+        for (idx, blob) in rows {
+            let rewritten = apply_home_remap_protobuf(&blob, from_h, to_h);
+            if rewritten != blob {
+                tx.execute(
+                    "UPDATE executor_metadata SET data = ?1 WHERE idx = ?2",
+                    params![rewritten, idx],
                 )?;
             }
         }
@@ -953,7 +986,9 @@ pub fn remap_conversation_artifacts_custom(
     }
 
     for cid in conversation_ids {
-        let conv_db_path = harness_dir.join("conversations").join(format!("{}.db", cid));
+        let conv_db_path = harness_dir
+            .join("conversations")
+            .join(format!("{}.db", cid));
         if conv_db_path.exists() {
             for (f, t) in &valid_pairs {
                 remap_single_conversation_db(&conv_db_path, f, t, deep_remap)?;
@@ -1007,6 +1042,162 @@ pub fn remap_conversation_artifacts_custom(
     }
 
     Ok(())
+}
+
+/// Detects and heals intra-host workspace path drift for `canonical_project_path` inside `harness_dir`:
+/// - Reconciles sessions whose `workspace_uris` already targets `canonical_project_path` while `raw_summary`
+///   or `*_summaries_proto.pb` still carries a stale pre-relocation `file://<local_home>/...` URI;
+/// - Propagates `canonical_project_path` to child subagent rows (excluding isolated `battle-overlays/`
+///   and `battle-clones/` worktrees) and sessions referencing non-existent old `<local_home>/.../<proj_name>` folders.
+pub fn heal_intra_host_workspace_drift(
+    harness_dir: &Path,
+    canonical_project_path: &Path,
+    local_home: &str,
+    deep_remap: bool,
+) -> Result<MergeStats> {
+    let db_path = harness_dir.join("conversation_summaries.db");
+    if !db_path.exists() {
+        return Ok(MergeStats::default());
+    }
+    let Some(proj_name) = canonical_project_path.file_name().and_then(|n| n.to_str()) else {
+        return Ok(MergeStats::default());
+    };
+    let canon_str = canonical_project_path
+        .to_string_lossy()
+        .trim_end_matches('/')
+        .to_string();
+    let canon_uri = format!("file://{}", canon_str);
+    let home_trimmed = local_home.trim_end_matches('/');
+    let home_uri_prefix = format!("file://{}/", home_trimmed);
+
+    struct RowMeta {
+        pid: String,
+        wuris: Vec<String>,
+        pb_uris: Vec<String>,
+    }
+
+    let mut by_cid: BTreeMap<String, RowMeta> = BTreeMap::new();
+    {
+        let conn = Connection::open(&db_path)?;
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(3000));
+        let mut stmt = conn.prepare(
+            "SELECT conversation_id, parent_conversation_id, workspace_uris, raw_summary FROM conversation_summaries",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                r.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default(),
+            ))
+        })?;
+        for row in rows.flatten() {
+            let (cid, pid, wu_json, raw) = row;
+            let wuris: Vec<String> = serde_json::from_str(&wu_json).unwrap_or_default();
+            let pb_uris = extract_protobuf_file_uris(&raw);
+            by_cid.insert(
+                cid,
+                RowMeta {
+                    pid,
+                    wuris,
+                    pb_uris,
+                },
+            );
+        }
+    }
+
+    let mut target_cids = BTreeSet::new();
+    for (cid, info) in &by_cid {
+        let all_u: Vec<&String> = info.wuris.iter().chain(info.pb_uris.iter()).collect();
+        if !all_u.is_empty()
+            && all_u
+                .iter()
+                .all(|u| u.contains("battle-overlays/") || u.contains("battle-clones/"))
+        {
+            continue;
+        }
+        let matches_canon = all_u
+            .iter()
+            .any(|u| *u == &canon_uri || u.starts_with(&format!("{}/", canon_uri)));
+        let matches_missing_old = !matches_canon
+            && all_u.iter().any(|u| {
+                if !u.starts_with(&home_uri_prefix) {
+                    return false;
+                }
+                let p = u.trim_start_matches("file://").trim_end_matches('/');
+                Path::new(p).file_name().and_then(|n| n.to_str()) == Some(proj_name)
+                    && !Path::new(p).exists()
+            });
+        if matches_canon || matches_missing_old {
+            target_cids.insert(cid.clone());
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (cid, info) in &by_cid {
+            if target_cids.contains(cid) || info.pid.is_empty() || !target_cids.contains(&info.pid)
+            {
+                continue;
+            }
+            let all_u: Vec<&String> = info.wuris.iter().chain(info.pb_uris.iter()).collect();
+            if !all_u.is_empty()
+                && all_u
+                    .iter()
+                    .all(|u| u.contains("battle-overlays/") || u.contains("battle-clones/"))
+            {
+                continue;
+            }
+            target_cids.insert(cid.clone());
+            changed = true;
+        }
+    }
+
+    let mut drift_cids = BTreeSet::new();
+    let mut old_paths_set = BTreeSet::new();
+    for cid in &target_cids {
+        let Some(info) = by_cid.get(cid) else {
+            continue;
+        };
+        let mut has_drift = false;
+        for u in info.wuris.iter().chain(info.pb_uris.iter()) {
+            if !u.starts_with(&home_uri_prefix)
+                || u.contains("battle-overlays/")
+                || u.contains("battle-clones/")
+            {
+                continue;
+            }
+            let p = u.trim_start_matches("file://").trim_end_matches('/');
+            if p != canon_str && !p.starts_with(&format!("{}/", canon_str)) && p != home_trimmed {
+                old_paths_set.insert(p.to_string());
+                has_drift = true;
+            }
+        }
+        let sql_ok = info
+            .wuris
+            .iter()
+            .any(|u| u == &canon_uri || u.starts_with(&format!("{}/", canon_uri)));
+        if has_drift || !sql_ok {
+            drift_cids.insert(cid.clone());
+        }
+    }
+
+    if drift_cids.is_empty() || old_paths_set.is_empty() {
+        return Ok(MergeStats::default());
+    }
+
+    let mut sorted_olds: Vec<String> = old_paths_set.into_iter().collect();
+    sorted_olds.sort_by_key(|b| std::cmp::Reverse(b.len()));
+    let replacements: Vec<(String, String)> = sorted_olds
+        .into_iter()
+        .map(|op| (op, canon_str.clone()))
+        .collect();
+
+    remap_conversation_artifacts_custom(harness_dir, &drift_cids, &replacements, deep_remap)?;
+    let mut manifest = export_project_manifest(harness_dir, &drift_cids, None)?;
+    remap_manifest_custom_strings(&mut manifest, &replacements);
+    merge_project_manifest(harness_dir, &manifest, true)
 }
 
 /// Surgically purges `conversation_ids` from `harness_dir`:
@@ -1299,7 +1490,10 @@ mod tests {
 
         let pb_win = make_dummy_proto_with_uri("file:///c%3A/Users/devuser/proj");
         let pb_linux = apply_home_remap_protobuf(&pb_win, win_home, linux_home);
-        assert_eq!(pb_linux, make_dummy_proto_with_uri("file:///home/devuser/proj"));
+        assert_eq!(
+            pb_linux,
+            make_dummy_proto_with_uri("file:///home/devuser/proj")
+        );
 
         // Linux -> Windows
         let remapped_to_win = apply_home_remap_str(
