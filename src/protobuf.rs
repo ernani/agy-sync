@@ -513,6 +513,10 @@ impl ProtobufSummariesMap {
         self.entries.insert(conversation_id, raw_summary);
     }
 
+    pub fn remove(&mut self, conversation_id: &str) -> bool {
+        self.entries.remove(conversation_id).is_some()
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }

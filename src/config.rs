@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -175,6 +176,148 @@ pub fn parse_ssh_config_port(ssh_config_content: &str, target_host: &str) -> Opt
         }
     }
     None
+}
+
+/// Persistent ledger entry for a single conversation tracked across machines and harnesses.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct LedgerSessionEntry {
+    pub conversation_id: String,
+    pub title: String,
+    pub step_count: i64,
+    pub parent_conversation_id: String,
+    #[serde(default)]
+    pub harnesses: BTreeSet<String>,
+    pub present_on_local: bool,
+    pub present_on_remote: bool,
+}
+
+/// Persistent ledger entry for a project workspace tracked across machines and harnesses.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct LedgerProjectEntry {
+    pub project_key: String,
+    pub local_path: String,
+    pub remote_path: String,
+    #[serde(default)]
+    pub coexisting_harnesses: BTreeSet<String>,
+    pub present_on_local: bool,
+    pub present_on_remote: bool,
+    #[serde(default)]
+    pub sessions: BTreeMap<String, LedgerSessionEntry>,
+}
+
+/// Persistent synchronization & coexistence ledger stored at `<gemini_root>/.agy_sync_ledger.json`.
+/// Enables detection of deleted conversations or deleted project workspaces that previously existed
+/// across Local, Remote, or coexisting harnesses so the user can choose to propagate deletions
+/// instead of silently resurrecting deleted items.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SyncStateLedger {
+    #[serde(default)]
+    pub projects: BTreeMap<String, LedgerProjectEntry>,
+}
+
+impl SyncStateLedger {
+    pub fn ledger_path(gemini_root: &Path) -> PathBuf {
+        gemini_root.join(".agy_sync_ledger.json")
+    }
+
+    pub fn load(gemini_root: &Path) -> Self {
+        let path = Self::ledger_path(gemini_root);
+        let Ok(content) = fs::read_to_string(&path) else {
+            return Self::default();
+        };
+        serde_json::from_str(&content).unwrap_or_default()
+    }
+
+    pub fn save(&self, gemini_root: &Path) -> Result<PathBuf> {
+        fs::create_dir_all(gemini_root)?;
+        let path = Self::ledger_path(gemini_root);
+        let serialized = serde_json::to_string_pretty(self)?;
+        fs::write(&path, format!("{}\n", serialized))
+            .with_context(|| format!("Failed to write sync ledger {}", path.display()))?;
+        Ok(path)
+    }
+
+    /// Canonical project key (relative tail under `$HOME` if possible, otherwise normalized path).
+    pub fn canonical_project_key(project_path: &Path) -> String {
+        let s = normalize_home_path_string(&project_path.to_string_lossy());
+        if let Some((_, _, rel)) = crate::discovery::split_home_and_relative(&s) {
+            if !rel.is_empty() {
+                return rel;
+            }
+        }
+        s
+    }
+
+    pub fn record_session(
+        &mut self,
+        project_path: &Path,
+        remote_path: &str,
+        harness_id: &str,
+        conversation_id: &str,
+        title: &str,
+        step_count: i64,
+        parent_conversation_id: &str,
+        present_on_local: bool,
+        present_on_remote: bool,
+    ) {
+        let key = Self::canonical_project_key(project_path);
+        let proj = self
+            .projects
+            .entry(key.clone())
+            .or_insert_with(|| LedgerProjectEntry {
+                project_key: key,
+                local_path: project_path.to_string_lossy().to_string(),
+                remote_path: remote_path.to_string(),
+                coexisting_harnesses: BTreeSet::new(),
+                present_on_local: true,
+                present_on_remote: !remote_path.is_empty(),
+                sessions: BTreeMap::new(),
+            });
+        proj.local_path = project_path.to_string_lossy().to_string();
+        if !remote_path.is_empty() {
+            proj.remote_path = remote_path.to_string();
+            proj.present_on_remote = true;
+        }
+        proj.present_on_local = true;
+        proj.coexisting_harnesses.insert(harness_id.to_string());
+
+        let sess = proj
+            .sessions
+            .entry(conversation_id.to_string())
+            .or_insert_with(|| LedgerSessionEntry {
+                conversation_id: conversation_id.to_string(),
+                title: title.to_string(),
+                step_count,
+                parent_conversation_id: parent_conversation_id.to_string(),
+                harnesses: BTreeSet::new(),
+                present_on_local,
+                present_on_remote,
+            });
+        if !title.is_empty() {
+            sess.title = title.to_string();
+        }
+        if step_count > sess.step_count {
+            sess.step_count = step_count;
+        }
+        if !parent_conversation_id.is_empty() {
+            sess.parent_conversation_id = parent_conversation_id.to_string();
+        }
+        sess.harnesses.insert(harness_id.to_string());
+        sess.present_on_local |= present_on_local;
+        sess.present_on_remote |= present_on_remote;
+    }
+
+    pub fn remove_session(&mut self, project_path: &Path, conversation_id: &str) {
+        let key = Self::canonical_project_key(project_path);
+        if let Some(proj) = self.projects.get_mut(&key) {
+            proj.sessions.remove(conversation_id);
+        }
+    }
+
+    pub fn remove_project(&mut self, project_path: &Path) {
+        let key = Self::canonical_project_key(project_path);
+        self.projects.remove(&key);
+    }
 }
 
 #[cfg(test)]
