@@ -473,12 +473,13 @@ pub fn find_matching_config_project_ids(
 }
 
 /// Scans `brain/` directories that are not already in `matched_ids` to see if any file inside
-/// them references `project_path_str` or `project_uri`.
+/// them references `project_path_str`, `project_uri`, or `rel_tail`.
 fn scan_orphan_brains(
     brain_root: &Path,
     already_known: &BTreeSet<String>,
     project_path_str: &str,
     project_uri: &str,
+    rel_tail: Option<&str>,
 ) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     let Ok(entries) = fs::read_dir(brain_root) else {
@@ -496,7 +497,7 @@ fn scan_orphan_brains(
         if !is_uuid(name) || already_known.contains(name) {
             continue;
         }
-        if dir_mentions_project(&path, project_path_str, project_uri, 0) {
+        if dir_mentions_project(&path, project_path_str, project_uri, rel_tail, 0) {
             found.insert(name.to_string());
         }
     }
@@ -507,6 +508,7 @@ fn dir_mentions_project(
     dir: &Path,
     project_path_str: &str,
     project_uri: &str,
+    rel_tail: Option<&str>,
     depth: usize,
 ) -> bool {
     if depth > 3 {
@@ -518,17 +520,38 @@ fn dir_mentions_project(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            if dir_mentions_project(&path, project_path_str, project_uri, depth + 1) {
+            let dname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if matches!(dname, ".git" | ".user_uploaded" | "steps" | "tasks") {
+                continue;
+            }
+            if dir_mentions_project(&path, project_path_str, project_uri, rel_tail, depth + 1) {
                 return true;
             }
         } else if path.is_file() {
+            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if matches!(ext, "md" | "json" | "jsonl" | "txt") {
                 if let Ok(mut f) = fs::File::open(&path) {
                     let mut buf = vec![0u8; 256 * 1024];
                     if let Ok(n) = f.read(&mut buf) {
                         let s = String::from_utf8_lossy(&buf[..n]);
-                        if s.contains(project_uri) || s.contains(project_path_str) {
+                        if fname.starts_with("transcript") && ext == "jsonl" {
+                            for line in s.lines() {
+                                if line.contains("\"USER_INPUT\"")
+                                    || line.contains("\"PLANNER_RESPONSE\"")
+                                {
+                                    if line.contains(project_uri)
+                                        || line.contains(project_path_str)
+                                        || rel_tail.is_some_and(|rt| line.contains(rt))
+                                    {
+                                        return true;
+                                    }
+                                }
+                            }
+                        } else if s.contains(project_uri)
+                            || s.contains(project_path_str)
+                            || rel_tail.is_some_and(|rt| s.contains(rt))
+                        {
                             return true;
                         }
                     }
@@ -537,6 +560,17 @@ fn dir_mentions_project(
         }
     }
     false
+}
+
+fn row_has_specific_project_uri(row: &RawDbRow) -> bool {
+    row.workspace_uris.iter().any(|u| {
+        if let Some((_, _, rel)) = split_home_and_relative(u) {
+            !rel.is_empty()
+        } else {
+            let trimmed = u.trim_start_matches("file://").trim();
+            !trimmed.is_empty() && !is_home_or_root_path(Path::new(trimmed), "")
+        }
+    })
 }
 
 /// Scans `transcript.jsonl` inside a session's `brain/<id>/.system_generated/logs/`
@@ -721,7 +755,90 @@ pub fn discover_project_sessions(
         });
     }
 
-    // 4. Transitive closure over parent_conversation_id AND transcript subagent links
+    // 4. Correlate unscoped ($HOME-only or empty URI) root sessions via conversations_fts & orphan brain/<uuid> scan
+    let is_home_root = is_home_or_root_path(&norm_project, "");
+    let rel_tail = split_home_and_relative(&project_path_str)
+        .map(|(_, _, r)| r)
+        .unwrap_or_default();
+    let valid_rel_tail = if rel_tail.matches('/').count() >= 2 {
+        Some(rel_tail.as_str())
+    } else {
+        None
+    };
+
+    let mut fts_evaluated_cids = BTreeSet::new();
+    if !is_home_root && summary_db_path.exists() {
+        let unscoped_cids: Vec<String> = all_db_rows
+            .values()
+            .filter(|r| {
+                r.parent_conversation_id.is_empty()
+                    && !matched_ids.contains(&r.conversation_id)
+                    && !row_has_specific_project_uri(r)
+            })
+            .map(|r| r.conversation_id.clone())
+            .collect();
+
+        if !unscoped_cids.is_empty() {
+            if let Ok(conn) = Connection::open_with_flags(
+                &summary_db_path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ) {
+                let _ = conn.busy_timeout(std::time::Duration::from_millis(2000));
+                let mut exist_stmt_opt = conn
+                    .prepare("SELECT 1 FROM conversations_fts WHERE conversation_id = ?1 LIMIT 1")
+                    .ok();
+                if let Ok(mut fts_stmt) = conn.prepare(
+                    "SELECT 1 FROM conversations_fts
+                     WHERE conversation_id = ?1
+                       AND (user_body LIKE ?2 OR agent_body LIKE ?2 OR user_body LIKE ?3 OR agent_body LIKE ?3)
+                     LIMIT 1",
+                ) {
+                    let pat_full = format!("%{}%", project_path_str);
+                    let pat_rel = format!("%{}%", valid_rel_tail.unwrap_or(&project_path_str));
+                    for u_cid in unscoped_cids {
+                        if let Some(ref mut exist_stmt) = exist_stmt_opt {
+                            if let Ok(mut erows) = exist_stmt.query(rusqlite::params![&u_cid]) {
+                                if erows.next().ok().flatten().is_some() {
+                                    fts_evaluated_cids.insert(u_cid.clone());
+                                }
+                            }
+                        }
+                        if let Ok(mut rows) =
+                            fts_stmt.query(rusqlite::params![&u_cid, &pat_full, &pat_rel])
+                        {
+                            if rows.next().ok().flatten().is_some() {
+                                matched_ids.insert(u_cid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut scoped_or_matched_ids: BTreeSet<String> = matched_ids.clone();
+    scoped_or_matched_ids.extend(fts_evaluated_cids);
+    for (cid, row) in &all_db_rows {
+        if row_has_specific_project_uri(row) || !row.parent_conversation_id.is_empty() {
+            scoped_or_matched_ids.insert(cid.clone());
+        }
+    }
+    let orphan_ids = if is_home_root {
+        BTreeSet::new()
+    } else {
+        scan_orphan_brains(
+            &harness_dir.join("brain"),
+            &scoped_or_matched_ids,
+            &project_path_str,
+            &project_uri,
+            valid_rel_tail,
+        )
+    };
+    for oid in &orphan_ids {
+        matched_ids.insert(oid.clone());
+    }
+
+    // 5. Transitive closure over parent_conversation_id AND transcript subagent links
     loop {
         let prev_len = matched_ids.len();
 
@@ -752,24 +869,6 @@ pub fn discover_project_sessions(
         if matched_ids.len() == prev_len {
             break;
         }
-    }
-
-    // 5. Scan orphan brain/<uuid> directories that weren't in SQLite DB
-    let is_home_root = is_home_or_root_path(&norm_project, "");
-    let mut known_ids: BTreeSet<String> = all_db_rows.keys().cloned().collect();
-    known_ids.extend(matched_ids.iter().cloned());
-    let orphan_ids = if is_home_root {
-        BTreeSet::new()
-    } else {
-        scan_orphan_brains(
-            &harness_dir.join("brain"),
-            &known_ids,
-            &project_path_str,
-            &project_uri,
-        )
-    };
-    for oid in &orphan_ids {
-        matched_ids.insert(oid.clone());
     }
 
     // 6. Build DiscoveredSession entries and collect all relative paths + byte sizes
@@ -894,6 +993,157 @@ pub fn discover_project_sessions(
         all_relative_paths: all_rel_set.into_iter().collect(),
         total_bytes,
     })
+}
+
+/// Ensures that any `conversation_id` correlated on the counterpart machine is also looked up by ID
+/// in `disc.harness_dir` (`conversation_summaries.db` and disk artifacts) even if `discover_project_sessions`
+/// did not independently correlate it on this side, preventing an existing session from being treated as absent (0 steps).
+pub fn hydrate_missing_counterpart_sessions(
+    disc: &mut ProjectDiscovery,
+    all_cids: &BTreeSet<String>,
+) {
+    let missing: Vec<String> = all_cids
+        .iter()
+        .filter(|cid| !disc.sessions.contains_key(*cid))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+
+    let summary_db_path = disc.harness_dir.join("conversation_summaries.db");
+    let mut db_rows: BTreeMap<String, RawDbRow> = BTreeMap::new();
+    if summary_db_path.exists() {
+        if let Ok(conn) = Connection::open_with_flags(
+            &summary_db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            let _ = conn.busy_timeout(std::time::Duration::from_millis(2000));
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT
+                    conversation_id,
+                    COALESCE(title, ''),
+                    COALESCE(preview, ''),
+                    COALESCE(step_count, 0),
+                    COALESCE(last_modified_time, ''),
+                    COALESCE(parent_conversation_id, ''),
+                    COALESCE(agent_name, ''),
+                    COALESCE(status, ''),
+                    COALESCE(project_id, ''),
+                    COALESCE(workspace_uris, '')
+                 FROM conversation_summaries
+                 WHERE conversation_id = ?1",
+            ) {
+                for cid in &missing {
+                    if let Ok(mut rows) = stmt.query(rusqlite::params![cid]) {
+                        if let Ok(Some(r)) = rows.next() {
+                            if let (
+                                Ok(id),
+                                Ok(title),
+                                Ok(preview),
+                                Ok(step_count),
+                                Ok(last_modified_time),
+                                Ok(parent_conversation_id),
+                                Ok(agent_name),
+                                Ok(status),
+                                Ok(project_id),
+                                Ok(raw_uris),
+                            ) = (
+                                r.get::<_, String>(0),
+                                r.get::<_, String>(1),
+                                r.get::<_, String>(2),
+                                r.get::<_, i64>(3),
+                                r.get::<_, String>(4),
+                                r.get::<_, String>(5),
+                                r.get::<_, String>(6),
+                                r.get::<_, String>(7),
+                                r.get::<_, String>(8),
+                                r.get::<_, String>(9),
+                            ) {
+                                db_rows.insert(
+                                    id.clone(),
+                                    RawDbRow {
+                                        conversation_id: id,
+                                        title,
+                                        preview,
+                                        step_count,
+                                        last_modified_time,
+                                        parent_conversation_id,
+                                        agent_name,
+                                        status,
+                                        project_id,
+                                        workspace_uris: if raw_uris.trim().is_empty() {
+                                            Vec::new()
+                                        } else {
+                                            serde_json::from_str(&raw_uris)
+                                                .unwrap_or_else(|_| vec![raw_uris])
+                                        },
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let empty_hist = BTreeMap::new();
+    let mut all_rel_set: BTreeSet<String> = disc.all_relative_paths.iter().cloned().collect();
+
+    for cid in missing {
+        let mut rel_paths = Vec::new();
+        let mut sess_bytes: u64 = 0;
+        let candidate_rels = [
+            format!("conversations/{}.db", cid),
+            format!("brain/{}", cid),
+            format!("annotations/{}.pbtxt", cid),
+            format!("implicit/{}.pb", cid),
+            format!("browser_recordings/{}", cid),
+            format!("html_artifacts/{}", cid),
+            format!("context_state/{}.pb", cid),
+        ];
+
+        for rel in candidate_rels {
+            let full = disc.harness_dir.join(&rel);
+            if full.exists() {
+                sess_bytes += compute_path_size(&full);
+                rel_paths.push(rel.clone());
+                all_rel_set.insert(rel);
+            }
+        }
+
+        if let Some(row) = db_rows.get(&cid) {
+            disc.total_bytes += sess_bytes;
+            let (ts_opt, last_prompt_snippet) =
+                extract_last_user_prompt(&disc.harness_dir, &cid, &row.preview, &empty_hist);
+            let effective_time = if !row.last_modified_time.is_empty() {
+                row.last_modified_time.clone()
+            } else {
+                ts_opt.unwrap_or_default()
+            };
+            disc.sessions.insert(
+                cid.clone(),
+                DiscoveredSession {
+                    conversation_id: cid,
+                    title: row.title.clone(),
+                    step_count: row.step_count,
+                    last_modified_time: effective_time,
+                    parent_conversation_id: row.parent_conversation_id.clone(),
+                    agent_name: row.agent_name.clone(),
+                    status: row.status.clone(),
+                    project_id: row.project_id.clone(),
+                    workspace_uris: row.workspace_uris.clone(),
+                    last_prompt_snippet,
+                    is_orphan_brain: false,
+                    relative_paths: rel_paths,
+                    total_bytes: sess_bytes,
+                },
+            );
+        }
+    }
+
+    disc.all_relative_paths = all_rel_set.into_iter().collect();
 }
 
 #[cfg(test)]
