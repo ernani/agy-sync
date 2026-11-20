@@ -602,6 +602,13 @@ pub fn merge_project_manifest(
             }
         }
 
+        if !target_app_data_dir.is_empty() {
+            let _ = tx.execute(
+                "UPDATE conversation_summaries SET app_data_dir = ?1 WHERE app_data_dir != ?1",
+                params![&target_app_data_dir],
+            );
+        }
+
         tx.commit()?;
     }
 
@@ -1103,6 +1110,37 @@ pub fn purge_sessions_from_harness(
     }
 
     Ok(purged_count.max(conversation_ids.len()))
+}
+
+/// Normalizes `app_data_dir` across all rows in `<harness_dir>/conversation_summaries.db`
+/// so they match `harness_dir`'s directory name (`"antigravity"`, `"antigravity-cli"`, etc.).
+pub fn normalize_harness_app_data_dir(harness_dir: &Path) -> Result<usize> {
+    let target_app_data_dir = harness_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+    if target_app_data_dir.is_empty() {
+        return Ok(0);
+    }
+    let db_path = harness_dir.join("conversation_summaries.db");
+    if !db_path.exists() {
+        return Ok(0);
+    }
+    let conn = Connection::open(&db_path)
+        .with_context(|| format!("Failed to open {}", db_path.display()))?;
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(3000));
+    let _ = ensure_summary_db_schema(&conn);
+    let updated = conn
+        .execute(
+            "UPDATE conversation_summaries SET app_data_dir = ?1 WHERE app_data_dir != ?1",
+            params![&target_app_data_dir],
+        )
+        .unwrap_or(0);
+    if updated > 0 {
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+    Ok(updated)
 }
 
 #[cfg(test)]

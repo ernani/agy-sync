@@ -8,8 +8,9 @@ use crate::harnesses::{
     HarnessKind,
 };
 use crate::index_merge::{
-    export_project_manifest, find_sessions_with_home_prefix, home_search_needles,
-    merge_project_manifest, purge_sessions_from_harness, remap_conversation_artifacts, MergeStats,
+     apply_home_remap_str, export_project_manifest, find_sessions_with_home_prefix,
+    home_search_needles, merge_project_manifest, normalize_harness_app_data_dir,
+    purge_sessions_from_harness, remap_conversation_artifacts, MergeStats,
 };
 use crate::transport::{
     ensure_sufficient_fd_limit, probe_remote, push_staged_remote_harness_index,
@@ -177,10 +178,136 @@ fn build_workspace_excludes(config: &EngineConfig) -> Vec<String> {
             "node_modules".to_string(),
             ".venv".to_string(),
             "__pycache__".to_string(),
+            ".terraform/providers".to_string(),
+            "terraform-provider-*".to_string(),
+            ".terragrunt-cache".to_string(),
         ]);
     }
     excludes.extend(config.extra_excludes.iter().cloned());
     excludes
+}
+
+fn current_terraform_os_prefix() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin_",
+        "linux" => "linux_",
+        "windows" => "windows_",
+        other => other,
+    }
+}
+
+/// Self-heals a synchronized project workspace for Terraform / Terragrunt portability:
+/// 1. When `!include_build_dirs`, removes disposable `.terragrunt-cache` directories and any
+///    foreign-OS `.terraform/providers/**/<os>_<arch>` binary directories (e.g. `linux_amd64` on macOS),
+///    while preserving `.terraform/terraform.tfstate`, `.terragrunt-local-state/`, `.parallel-state/`, and `*.tfstate*`.
+/// 2. When `foreign_home` is provided, rewrites `foreign_home` -> `local_home` inside any `.tfstate` or
+///    `.tfstate.backup` files so local backend state pointers remain valid across machines.
+pub fn self_heal_workspace_terraform_artifacts(
+    workspace_dir: &Path,
+    foreign_home: Option<&str>,
+    local_home: &str,
+    include_build_dirs: bool,
+    dry_run: bool,
+) -> Result<(usize, usize)> {
+    if !workspace_dir.exists() {
+        return Ok((0, 0));
+    }
+    let mut removed_dirs = 0usize;
+    let mut remapped_states = 0usize;
+    let native_os_prefix = current_terraform_os_prefix();
+
+    fn walk_tf(
+        dir: &Path,
+        in_tf_providers: bool,
+        native_os_prefix: &str,
+        foreign_home: Option<&str>,
+        local_home: &str,
+        include_build_dirs: bool,
+        dry_run: bool,
+        removed_dirs: &mut usize,
+        remapped_states: &mut usize,
+    ) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if p.is_dir() {
+                if matches!(name, ".git" | "target" | "node_modules" | ".venv" | "__pycache__") {
+                    continue;
+                }
+                if !include_build_dirs && name == ".terragrunt-cache" {
+                    if !dry_run && fs::remove_dir_all(&p).is_ok() {
+                        println!("  [self-heal] Removed .terragrunt-cache: {}", p.display());
+                    }
+                    *removed_dirs += 1;
+                    continue;
+                }
+                if !include_build_dirs && in_tf_providers {
+                    let is_os_arch_dir = (name.starts_with("linux_")
+                        || name.starts_with("darwin_")
+                        || name.starts_with("windows_")
+                        || name.starts_with("freebsd_"))
+                        && !name.starts_with(native_os_prefix);
+                    if is_os_arch_dir {
+                        if !dry_run && fs::remove_dir_all(&p).is_ok() {
+                            println!(
+                                "  [self-heal] Removed foreign-OS Terraform provider dir: {}",
+                                p.display()
+                            );
+                        }
+                        *removed_dirs += 1;
+                        continue;
+                    }
+                }
+                let next_in_providers = in_tf_providers
+                    || (name == "providers"
+                        && dir.file_name().and_then(|n| n.to_str()) == Some(".terraform"));
+                walk_tf(
+                    &p,
+                    next_in_providers,
+                    native_os_prefix,
+                    foreign_home,
+                    local_home,
+                    include_build_dirs,
+                    dry_run,
+                    removed_dirs,
+                    remapped_states,
+                );
+            } else if p.is_file() {
+                if let Some(fh) = foreign_home.filter(|s| !s.is_empty() && *s != local_home) {
+                    if name.ends_with(".tfstate") || name.ends_with(".tfstate.backup") {
+                        if let Ok(content) = fs::read_to_string(&p) {
+                            let updated = apply_home_remap_str(&content, fh, local_home);
+                            if updated != content {
+                                if !dry_run {
+                                    let _ = fs::write(&p, updated);
+                                }
+                                *remapped_states += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    walk_tf(
+        workspace_dir,
+        false,
+        native_os_prefix,
+        foreign_home,
+        local_home,
+        include_build_dirs,
+        dry_run,
+        &mut removed_dirs,
+        &mut remapped_states,
+    );
+
+    Ok((removed_dirs, remapped_states))
 }
 
 /// Copies specific relative files from `src_root` into `dst_root` so they can be remapped in-place
@@ -1051,6 +1178,7 @@ fn run_session_harness(
     }
 
     if !config.dry_run {
+        let _ = normalize_harness_app_data_dir(&local_harness_dir);
         for cid in &all_cids {
             if local_purge_cids.contains(cid) || remote_purge_cids.contains(cid) {
                 continue;
@@ -1406,6 +1534,15 @@ pub fn run_engine(config: &EngineConfig) -> Result<SyncReport> {
             }
             SyncMode::Inspect => unreachable!(),
         }
+
+        let foreign_home_opt = remap_enabled.then_some(probe.remote_home.as_str());
+        let _ = self_heal_workspace_terraform_artifacts(
+            &norm_project,
+            foreign_home_opt,
+            &config.local_home,
+            config.include_build_dirs,
+            config.dry_run,
+        );
     }
 
     let mut pushed_cids = BTreeSet::new();
@@ -1467,4 +1604,74 @@ pub fn run_engine(config: &EngineConfig) -> Result<SyncReport> {
         remote_merge_stats,
         harness_reports,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_terraform_state_preservation_and_leftover_self_healing() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let ws = tmp.path().join("project");
+        let tg_cache = ws.join("infra/uat/.terragrunt-cache/abc/def");
+        let tg_state_dir = ws.join("infra/uat/.terragrunt-local-state");
+        let tf_dir = ws.join("terraform/.terraform");
+        let foreign_os = if std::env::consts::OS == "macos" {
+            "linux_amd64"
+        } else {
+            "darwin_arm64"
+        };
+        let native_os = if std::env::consts::OS == "macos" {
+            "darwin_arm64"
+        } else {
+            "linux_amd64"
+        };
+        let foreign_prov = tf_dir
+            .join("providers/registry.terraform.io/hashicorp/google/8.10.0")
+            .join(foreign_os);
+        let native_prov = tf_dir
+            .join("providers/registry.terraform.io/hashicorp/google/8.10.0")
+            .join(native_os);
+
+        fs::create_dir_all(&tg_cache)?;
+        fs::create_dir_all(&tg_state_dir)?;
+        fs::create_dir_all(&foreign_prov)?;
+        fs::create_dir_all(&native_prov)?;
+
+        fs::write(tg_cache.join("backend_tg.tf"), b"# cached")?;
+        fs::write(
+            tg_state_dir.join("terraform.tfstate"),
+            r#"{"version":4,"outputs":{"path":"/home/remoteuser/project/out"}}"#,
+        )?;
+        fs::write(
+            tf_dir.join("terraform.tfstate"),
+            r#"{"version":3,"backend":{"type":"local","config":{"path":"/home/remoteuser/project/infra/uat/.terragrunt-local-state/terraform.tfstate"}}}"#,
+        )?;
+        fs::write(foreign_prov.join("terraform-provider-google"), b"elf-bin")?;
+        fs::write(native_prov.join("terraform-provider-google"), b"native-bin")?;
+
+        let (removed_dirs, remapped_states) = self_heal_workspace_terraform_artifacts(
+            &ws,
+            Some("/home/remoteuser"),
+            "/Users/localdev",
+            false,
+            false,
+        )?;
+        assert_eq!(removed_dirs, 2);
+        assert_eq!(remapped_states, 2);
+
+        // .terragrunt-cache and foreign provider binary dir are gone
+        assert!(!ws.join("infra/uat/.terragrunt-cache").exists());
+        assert!(!foreign_prov.exists());
+
+        // Native provider binary and all .tfstate files are preserved and $HOME-remapped
+        assert!(native_prov.exists());
+        let backend_tfstate = fs::read_to_string(tf_dir.join("terraform.tfstate"))?;
+        assert!(backend_tfstate.contains("/Users/localdev/project/infra/uat/.terragrunt-local-state/terraform.tfstate"));
+        let local_tfstate = fs::read_to_string(tg_state_dir.join("terraform.tfstate"))?;
+        assert!(local_tfstate.contains("/Users/localdev/project/out"));
+
+        Ok(())
+    }
 }
