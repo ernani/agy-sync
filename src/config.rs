@@ -187,6 +187,8 @@ pub struct LedgerSessionEntry {
     pub parent_conversation_id: String,
     #[serde(default)]
     pub harnesses: BTreeSet<String>,
+    #[serde(default)]
+    pub remote_synced_harnesses: BTreeSet<String>,
     pub present_on_local: bool,
     pub present_on_remote: bool,
 }
@@ -290,6 +292,7 @@ impl SyncStateLedger {
                 step_count,
                 parent_conversation_id: parent_conversation_id.to_string(),
                 harnesses: BTreeSet::new(),
+                remote_synced_harnesses: BTreeSet::new(),
                 present_on_local,
                 present_on_remote,
             });
@@ -303,6 +306,9 @@ impl SyncStateLedger {
             sess.parent_conversation_id = parent_conversation_id.to_string();
         }
         sess.harnesses.insert(harness_id.to_string());
+        if present_on_local && present_on_remote {
+            sess.remote_synced_harnesses.insert(harness_id.to_string());
+        }
         sess.present_on_local |= present_on_local;
         sess.present_on_remote |= present_on_remote;
     }
