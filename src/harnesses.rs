@@ -332,10 +332,7 @@ fn discover_agy_ide_plugins(project_path: &Path, gemini_root: &Path) -> Result<H
     })
 }
 
-fn discover_gemini_cli_legacy(
-    project_path: &Path,
-    gemini_root: &Path,
-) -> Result<HarnessDiscovery> {
+fn discover_gemini_cli_legacy(project_path: &Path, gemini_root: &Path) -> Result<HarnessDiscovery> {
     let norm_project = normalize_project_path(project_path);
     let project_uri = path_to_file_uri(&norm_project);
 
@@ -566,7 +563,11 @@ pub fn merge_legacy_gemini_cli_metadata(
         serde_json::json!({ "projects": {} })
     };
 
-    if root_val.get("projects").and_then(|p| p.as_object()).is_none() {
+    if root_val
+        .get("projects")
+        .and_then(|p| p.as_object())
+        .is_none()
+    {
         root_val["projects"] = serde_json::json!({});
     }
     if let Some(obj) = root_val.get_mut("projects").and_then(|p| p.as_object_mut()) {
@@ -624,10 +625,7 @@ pub struct WorkspaceEqualityReport {
 impl WorkspaceEqualityReport {
     pub fn summary_line(&self) -> String {
         if self.same_canonical_path {
-            return format!(
-                "SAME WORKSPACE FOLDER ({})",
-                self.path_a.display()
-            );
+            return format!("SAME WORKSPACE FOLDER ({})", self.path_a.display());
         }
         if self.is_equal {
             let commit = self.a_git_head.as_deref().unwrap_or("no-git");
@@ -876,14 +874,15 @@ pub fn discover_all_projects_in_harness(
         if stripped.is_empty() {
             continue;
         }
-        let candidate_path = if let Some((_, _, rel)) = crate::discovery::split_home_and_relative(stripped) {
-            if rel.is_empty() {
-                continue;
-            }
-            PathBuf::from(format!("{}{}", local_home.trim_end_matches('/'), rel))
-        } else {
-            PathBuf::from(stripped)
-        };
+        let candidate_path =
+            if let Some((_, _, rel)) = crate::discovery::split_home_and_relative(stripped) {
+                if rel.is_empty() {
+                    continue;
+                }
+                PathBuf::from(format!("{}{}", local_home.trim_end_matches('/'), rel))
+            } else {
+                PathBuf::from(stripped)
+            };
         if !is_home_or_root_path(&candidate_path, local_home) {
             paths.insert(normalize_project_path(&candidate_path));
         }
@@ -892,8 +891,10 @@ pub fn discover_all_projects_in_harness(
     Ok(paths)
 }
 
-/// Appends any root sessions from `sessions` that are not yet present in `<cli_harness_dir>/history.jsonl`
-/// and registers `project_path` in `<cli_harness_dir>/settings.json` (`trustedWorkspaces`).
+/// Appends any root sessions from `sessions` that are not yet present in `history.jsonl`,
+/// registers `project_path` in `settings.json` (`trustedWorkspaces`), and reconciles
+/// `cache/last_conversations.json` + `cache/conversation_metadata.json` across both
+/// `<cli_harness_dir>/` and `<cli_harness_dir>/cli/` (when a nested `cli/` layout is present).
 pub fn sync_cli_history_and_trust(
     cli_harness_dir: &Path,
     project_path: &Path,
@@ -908,67 +909,246 @@ pub fn sync_cli_history_and_trust(
     }
     fs::create_dir_all(cli_harness_dir)?;
 
-    let ws_str = project_path.to_string_lossy().to_string();
-    let hist_path = cli_harness_dir.join("history.jsonl");
-    let existing_hist = fs::read_to_string(&hist_path).unwrap_or_default();
+    let ws_str = project_path
+        .to_string_lossy()
+        .trim_end_matches('/')
+        .to_string();
+    let ws_uri = format!("file://{}", ws_str);
+    let proj_name = project_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let session_cids: BTreeSet<String> = sessions.keys().cloned().collect();
 
-    let mut added = 0usize;
-    let mut new_lines = Vec::new();
+    // Pick newest root session in `sessions` for `last_conversations.json`
+    let newest_root_cid: Option<String> = sessions
+        .values()
+        .filter(|s| s.parent_conversation_id.is_empty())
+        .max_by(|a, b| {
+            a.last_modified_time
+                .cmp(&b.last_modified_time)
+                .then_with(|| a.step_count.cmp(&b.step_count))
+        })
+        .map(|s| s.conversation_id.clone());
+
+    let mut candidate_roots = Vec::new();
+    let nested_cli = cli_harness_dir.join("cli");
+    if nested_cli.is_dir() {
+        candidate_roots.push((nested_cli, true));
+        if cli_harness_dir.join("history.jsonl").exists()
+            || cli_harness_dir.join("settings.json").exists()
+            || cli_harness_dir.join("cache").is_dir()
+        {
+            candidate_roots.push((cli_harness_dir.to_path_buf(), false));
+        }
+    } else {
+        candidate_roots.push((cli_harness_dir.to_path_buf(), true));
+    }
+
+    let mut total_added = 0usize;
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(1_760_000_000_000);
 
-    for sess in sessions.values() {
-        if !sess.parent_conversation_id.is_empty() {
-            continue;
-        }
-        if existing_hist.contains(&sess.conversation_id) {
-            continue;
-        }
-        let display = if !sess.last_prompt_snippet.is_empty() {
-            sess.last_prompt_snippet.clone()
-        } else if !sess.title.is_empty() {
-            sess.title.clone()
-        } else {
-            format!("Session {}", &sess.conversation_id[..8])
-        };
-        let entry = serde_json::json!({
-            "display": display,
-            "timestamp": now_ms,
-            "workspace": ws_str,
-            "conversationId": sess.conversation_id,
-        });
-        if let Ok(line) = serde_json::to_string(&entry) {
-            new_lines.push(line);
-            added += 1;
-        }
-    }
+    for (croot, primary_hist) in candidate_roots {
+        // 1. history.jsonl
+        let hist_path = croot.join("history.jsonl");
+        if primary_hist || hist_path.exists() {
+            let existing_hist = fs::read_to_string(&hist_path).unwrap_or_default();
+            let mut updated_lines = Vec::new();
+            let mut hist_rewritten = false;
 
-    if !new_lines.is_empty() {
-        let mut combined = existing_hist;
-        if !combined.is_empty() && !combined.ends_with('\n') {
-            combined.push('\n');
-        }
-        combined.push_str(&new_lines.join("\n"));
-        combined.push('\n');
-        fs::write(&hist_path, combined)?;
-    }
+            for line in existing_hist.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(mut obj) = serde_json::from_str::<serde_json::Value>(line) {
+                    let cid_match = obj
+                        .get("conversationId")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|c| session_cids.contains(c));
+                    if cid_match {
+                        if let Some(old_ws) = obj.get("workspace").and_then(|v| v.as_str()) {
+                            if old_ws != ws_str
+                                && !old_ws.starts_with(&format!("{}/", ws_str))
+                                && !Path::new(old_ws).exists()
+                            {
+                                obj["workspace"] = serde_json::Value::String(ws_str.clone());
+                                if let Ok(s) = serde_json::to_string(&obj) {
+                                    updated_lines.push(s);
+                                    hist_rewritten = true;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                updated_lines.push(line.to_string());
+            }
 
-    // Update settings.json trustedWorkspaces if settings.json exists
-    let settings_path = cli_harness_dir.join("settings.json");
-    if settings_path.exists() {
-        if let Ok(content) = fs::read_to_string(&settings_path) {
-            if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(arr) = val
-                    .get_mut("trustedWorkspaces")
-                    .and_then(|v| v.as_array_mut())
-                {
-                    let already = arr.iter().any(|x| x.as_str() == Some(ws_str.as_str()));
-                    if !already {
-                        arr.push(serde_json::Value::String(ws_str));
-                        if let Ok(pretty) = serde_json::to_string_pretty(&val) {
-                            let _ = fs::write(&settings_path, format!("{}\n", pretty));
+            let mut added = 0usize;
+            for sess in sessions.values() {
+                if !sess.parent_conversation_id.is_empty() {
+                    continue;
+                }
+                if existing_hist.contains(&sess.conversation_id) {
+                    continue;
+                }
+                let display = if !sess.last_prompt_snippet.is_empty() {
+                    sess.last_prompt_snippet.clone()
+                } else if !sess.title.is_empty() {
+                    sess.title.clone()
+                } else {
+                    format!(
+                        "Session {}",
+                        &sess.conversation_id[..8.min(sess.conversation_id.len())]
+                    )
+                };
+                let entry = serde_json::json!({
+                    "display": display,
+                    "timestamp": now_ms,
+                    "workspace": ws_str,
+                    "conversationId": sess.conversation_id,
+                });
+                if let Ok(line) = serde_json::to_string(&entry) {
+                    updated_lines.push(line);
+                    added += 1;
+                }
+            }
+
+            if hist_rewritten || added > 0 {
+                fs::write(&hist_path, format!("{}\n", updated_lines.join("\n")))?;
+                total_added += added;
+            }
+        }
+
+        // 2. settings.json trustedWorkspaces
+        let settings_path = croot.join("settings.json");
+        if settings_path.exists() {
+            if let Ok(content) = fs::read_to_string(&settings_path) {
+                if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(arr) = val
+                        .get_mut("trustedWorkspaces")
+                        .and_then(|v| v.as_array_mut())
+                    {
+                        let mut modified = false;
+                        for elem in arr.iter_mut() {
+                            if let Some(s) = elem.as_str() {
+                                if s != ws_str
+                                    && !proj_name.is_empty()
+                                    && Path::new(s).file_name().and_then(|n| n.to_str())
+                                        == Some(proj_name)
+                                    && !Path::new(s).exists()
+                                {
+                                    *elem = serde_json::Value::String(ws_str.clone());
+                                    modified = true;
+                                }
+                            }
+                        }
+                        if !arr.iter().any(|x| x.as_str() == Some(ws_str.as_str())) {
+                            arr.push(serde_json::Value::String(ws_str.clone()));
+                            modified = true;
+                        }
+                        if modified {
+                            if let Ok(pretty) = serde_json::to_string_pretty(&val) {
+                                let _ = fs::write(&settings_path, format!("{}\n", pretty));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. cache/last_conversations.json
+        let last_conv_path = croot.join("cache").join("last_conversations.json");
+        if last_conv_path.exists() {
+            if let Some(ref best_cid) = newest_root_cid {
+                if let Ok(content) = fs::read_to_string(&last_conv_path) {
+                    if let Ok(mut map) = serde_json::from_str::<BTreeMap<String, String>>(&content)
+                    {
+                        let mut lc_changed = false;
+                        // Remove stale dead keys pointing to one of this project's sessions
+                        let dead_keys: Vec<String> = map
+                            .iter()
+                            .filter_map(|(k, v)| {
+                                if session_cids.contains(v)
+                                    && k != &ws_str
+                                    && !k.starts_with(&format!("{}/", ws_str))
+                                    && !Path::new(k).exists()
+                                {
+                                    Some(k.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        for dk in dead_keys {
+                            map.remove(&dk);
+                            lc_changed = true;
+                        }
+                        // Set canonical workspace pointer if missing or pointing to a conversation outside `sessions`
+                        let needs_set = match map.get(&ws_str) {
+                            None => true,
+                            Some(cur) => !session_cids.contains(cur),
+                        };
+                        if needs_set {
+                            map.insert(ws_str.clone(), best_cid.clone());
+                            lc_changed = true;
+                        }
+                        if lc_changed {
+                            if let Ok(pretty) = serde_json::to_string_pretty(&map) {
+                                let _ = fs::write(&last_conv_path, format!("{}\n", pretty));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. cache/conversation_metadata.json
+        let conv_meta_path = croot.join("cache").join("conversation_metadata.json");
+        if conv_meta_path.exists() {
+            if let Ok(content) = fs::read_to_string(&conv_meta_path) {
+                if let Ok(mut root_val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    let mut cm_changed = false;
+                    if let Some(convs_obj) = root_val
+                        .get_mut("conversations")
+                        .and_then(|v| v.as_object_mut())
+                    {
+                        for cid in &session_cids {
+                            if let Some(summary_obj) = convs_obj
+                                .get_mut(cid)
+                                .and_then(|e| e.get_mut("summary"))
+                                .and_then(|s| s.as_object_mut())
+                            {
+                                let cur_ok = summary_obj
+                                    .get("WorkspaceURIs")
+                                    .and_then(|w| w.as_array())
+                                    .is_some_and(|arr| {
+                                        !arr.is_empty()
+                                            && arr.iter().all(|u| {
+                                                u.as_str().is_some_and(|s| {
+                                                    s == ws_uri
+                                                        || s.starts_with(&format!("{}/", ws_uri))
+                                                        || s.contains("battle-overlays/")
+                                                        || s.contains("battle-clones/")
+                                                })
+                                            })
+                                    });
+                                if !cur_ok {
+                                    summary_obj.insert(
+                                        "WorkspaceURIs".to_string(),
+                                        serde_json::json!([ws_uri]),
+                                    );
+                                    cm_changed = true;
+                                }
+                            }
+                        }
+                    }
+                    if cm_changed {
+                        if let Ok(pretty) = serde_json::to_string_pretty(&root_val) {
+                            let _ = fs::write(&conv_meta_path, format!("{}\n", pretty));
                         }
                     }
                 }
@@ -976,7 +1156,7 @@ pub fn sync_cli_history_and_trust(
         }
     }
 
-    Ok(added)
+    Ok(total_added)
 }
 
 /// Ensures an `agy-2.0` (`~/.gemini/antigravity`) harness directory has completed onboarding
@@ -1132,7 +1312,10 @@ pub fn migrate_project_between_local_harnesses(
     let mut purged_count = 0usize;
 
     // 1. Copy/merge from src -> dst if CoexistInBoth or OnlyInTarget
-    if matches!(placement, PlacementMode::CoexistInBoth | PlacementMode::OnlyInTarget) {
+    if matches!(
+        placement,
+        PlacementMode::CoexistInBoth | PlacementMode::OnlyInTarget
+    ) {
         let mut to_copy_to_dst = BTreeSet::new();
         for cid in &all_cids {
             let s_opt = src_disc.sessions.get(cid);
@@ -1189,7 +1372,10 @@ pub fn migrate_project_between_local_harnesses(
             total_stats.protobuf_entries_updated += st.protobuf_entries_updated;
         }
 
-        if dst_sub == "antigravity-cli" || dst_harness_dir.join("history.jsonl").exists() {
+        if dst_sub == "antigravity-cli"
+            || dst_harness_dir.join("history.jsonl").exists()
+            || dst_harness_dir.join("cli").is_dir()
+        {
             let refreshed_dst = discover_project_sessions(&norm_dst_proj, dst_harness_dir)?;
             let _ = sync_cli_history_and_trust(
                 dst_harness_dir,
@@ -1204,7 +1390,10 @@ pub fn migrate_project_between_local_harnesses(
     }
 
     // 2. Copy/merge from dst -> src if CoexistInBoth or OnlyInSource
-    if matches!(placement, PlacementMode::CoexistInBoth | PlacementMode::OnlyInSource) {
+    if matches!(
+        placement,
+        PlacementMode::CoexistInBoth | PlacementMode::OnlyInSource
+    ) {
         let mut to_copy_to_src = BTreeSet::new();
         for cid in &all_cids {
             let s_opt = src_disc.sessions.get(cid);
@@ -1283,7 +1472,10 @@ pub fn migrate_project_between_local_harnesses(
             total_stats.protobuf_entries_updated += st.protobuf_entries_updated;
         }
 
-        if src_sub == "antigravity-cli" || src_harness_dir.join("history.jsonl").exists() {
+        if src_sub == "antigravity-cli"
+            || src_harness_dir.join("history.jsonl").exists()
+            || src_harness_dir.join("cli").is_dir()
+        {
             let refreshed_src = discover_project_sessions(&norm_dst_proj, src_harness_dir)?;
             let _ = sync_cli_history_and_trust(
                 src_harness_dir,
@@ -1435,7 +1627,11 @@ mod tests {
         fs::create_dir_all(&brain_a)?;
         fs::write(
             brain_a.join("notes.md"),
-            format!("Link: {}/.gemini/custom-store/brain/{}/notes.md", tmp.path().display(), cid),
+            format!(
+                "Link: {}/.gemini/custom-store/brain/{}/notes.md",
+                tmp.path().display(),
+                cid
+            ),
         )?;
 
         // 1. CoexistInBoth + relocate old_proj -> new_proj
@@ -1474,6 +1670,139 @@ mod tests {
         assert_eq!(purged2, 1);
         assert!(!harness_a.join(format!("conversations/{}.db", cid)).exists());
         assert!(harness_b.join(format!("conversations/{}.db", cid)).exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_heal_intra_host_drift_and_nested_cli_caches() -> Result<()> {
+        use crate::index_merge::{ensure_summary_db_schema, heal_intra_host_workspace_drift};
+        use crate::protobuf::{encode_varint, extract_protobuf_file_uris, ProtobufSummariesMap};
+
+        let tmp = tempfile::tempdir()?;
+        let home_dir = tmp.path();
+        let old_proj = home_dir.join("Downloads/old-root/alpha-dashboard");
+        // Note: `old_proj` intentionally does NOT exist on disk (already moved!)
+        let new_proj = home_dir.join("Documents/projects/alpha-dashboard");
+        fs::create_dir_all(&new_proj)?;
+        let norm_new = normalize_project_path(&new_proj);
+
+        let harness = home_dir.join(".gemini/custom-cli-store");
+        fs::create_dir_all(harness.join("conversations"))?;
+        fs::create_dir_all(harness.join("cli/cache"))?;
+
+        let old_uri = format!("file://{}", old_proj.display());
+        let new_uri = format!("file://{}", norm_new.display());
+
+        // Build raw_summary still pointing to `old_uri` while SQL column points to `new_uri`
+        let mut raw_old = Vec::new();
+        let mut ws_sub = Vec::new();
+        encode_varint(0x0a, &mut ws_sub);
+        encode_varint(old_uri.len() as u64, &mut ws_sub);
+        ws_sub.extend_from_slice(old_uri.as_bytes());
+        encode_varint((9 << 3) | 2, &mut raw_old);
+        encode_varint(ws_sub.len() as u64, &mut raw_old);
+        raw_old.extend_from_slice(&ws_sub);
+
+        let root_cid = "3db64390-818e-4344-8a6f-c48056c8cdbd";
+        let sub_cid = "fd70045c-6cbe-433f-bce0-6776c2f81c1d";
+
+        let db_path = harness.join("conversation_summaries.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path)?;
+            ensure_summary_db_schema(&conn)?;
+            conn.execute(
+                "INSERT INTO conversation_summaries (
+                    conversation_id, title, preview, step_count, last_modified_time,
+                    workspace_uris, status, agent_name, parent_conversation_id, project_id,
+                    last_user_input_time, app_data_dir, raw_summary
+                ) VALUES (?1, 'Root Alpha', '', 120, '2026-11-05T17:25:14Z', ?2, '', '', '', 'default-cli-project', '', 'custom-cli-store', ?3)",
+                rusqlite::params![root_cid, format!("[\"{}\"]", new_uri), &raw_old],
+            )?;
+            conn.execute(
+                "INSERT INTO conversation_summaries (
+                    conversation_id, title, preview, step_count, last_modified_time,
+                    workspace_uris, status, agent_name, parent_conversation_id, project_id,
+                    last_user_input_time, app_data_dir, raw_summary
+                ) VALUES (?1, '', '', 25, '2026-10-31T13:15:15Z', ?2, '', 'research', ?3, 'default-cli-project', '', 'custom-cli-store', ?4)",
+                rusqlite::params![sub_cid, format!("[\"{}\"]", old_uri), root_cid, &raw_old],
+            )?;
+        }
+
+        let pb_path = harness.join("store_summaries_proto.pb");
+        let mut pb_map = ProtobufSummariesMap::default();
+        pb_map.upsert(root_cid.to_string(), raw_old.clone());
+        pb_map.upsert(sub_cid.to_string(), raw_old.clone());
+        pb_map.save_to_path(&pb_path)?;
+
+        // Conversation DB with executor_metadata carrying old_uri
+        let cdb_path = harness.join(format!("conversations/{}.db", root_cid));
+        {
+            let cconn = rusqlite::Connection::open(&cdb_path)?;
+            cconn.execute_batch(
+                "CREATE TABLE executor_metadata (idx INTEGER PRIMARY KEY, data BLOB);",
+            )?;
+            cconn.execute(
+                "INSERT INTO executor_metadata (idx, data) VALUES (0, ?1)",
+                rusqlite::params![&raw_old],
+            )?;
+        }
+
+        // Poisoned nested cli/cache/last_conversations.json + old settings.json
+        let lc_path = harness.join("cli/cache/last_conversations.json");
+        fs::write(
+            &lc_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                old_proj.to_string_lossy().to_string(): root_cid,
+                norm_new.to_string_lossy().to_string(): "a4ac8baa-0000-0000-0000-000000000000"
+            }))?,
+        )?;
+        fs::write(
+            harness.join("cli/settings.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "trustedWorkspaces": [old_proj.to_string_lossy().to_string()]
+            }))?,
+        )?;
+
+        let stats = heal_intra_host_workspace_drift(
+            &harness,
+            &norm_new,
+            &home_dir.to_string_lossy(),
+            false,
+        )?;
+        assert_eq!(stats.summaries_upserted, 2);
+
+        let disc = discover_project_sessions(&norm_new, &harness)?;
+        sync_cli_history_and_trust(&harness, &norm_new, &disc.sessions, false)?;
+
+        // Verify raw_summary + .pb + executor_metadata + last_conversations.json!
+        let pb_after = ProtobufSummariesMap::load_from_path(&pb_path)?;
+        assert_eq!(
+            extract_protobuf_file_uris(pb_after.get(root_cid).unwrap()),
+            vec![new_uri.clone()]
+        );
+        assert_eq!(
+            extract_protobuf_file_uris(pb_after.get(sub_cid).unwrap()),
+            vec![new_uri.clone()]
+        );
+
+        let cconn = rusqlite::Connection::open(&cdb_path)?;
+        let exec_after: Vec<u8> = cconn.query_row(
+            "SELECT data FROM executor_metadata WHERE idx = 0",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(extract_protobuf_file_uris(&exec_after), vec![new_uri]);
+
+        let lc_after: BTreeMap<String, String> =
+            serde_json::from_str(&fs::read_to_string(&lc_path)?)?;
+        assert_eq!(
+            lc_after
+                .get(&norm_new.to_string_lossy().to_string())
+                .map(String::as_str),
+            Some(root_cid)
+        );
+        assert!(!lc_after.contains_key(&old_proj.to_string_lossy().to_string()));
 
         Ok(())
     }

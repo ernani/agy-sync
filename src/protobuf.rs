@@ -92,6 +92,140 @@ pub fn is_likely_protobuf_message(buf: &[u8]) -> bool {
     field_count > 0 && pos == buf.len()
 }
 
+/// Checks whether `buf` is a syntactically well-formed Protobuf submessage (with `1 <= field_num <= 512`)
+/// where at least one length-delimited child field contains `needle` intact.
+///
+/// Checking this *before* `std::str::from_utf8` prevents single-field submessages whose tag happens
+/// to be `0x0A` (`\n`) and whose varint length happens to be printable ASCII (`0x20..=0x7E`, e.g. `0x4E` = `'N'` = 78)
+/// from being mistaken for newline-prefixed plain-text strings!
+pub fn is_protobuf_submessage_with_needle(buf: &[u8], needle: &[u8]) -> bool {
+    if buf.len() < 2 || needle.is_empty() {
+        return false;
+    }
+    let mut pos = 0;
+    let mut field_count = 0usize;
+    let mut saw_child_with_needle = false;
+    while pos < buf.len() {
+        let Ok((tag, tag_len)) = decode_varint(&buf[pos..]) else {
+            return false;
+        };
+        let field_num = tag >> 3;
+        let wire_type = tag & 0x07;
+        if field_num == 0 || field_num > 512 {
+            return false;
+        }
+        pos += tag_len;
+        match wire_type {
+            0 => {
+                let Ok((_, v_len)) = decode_varint(&buf[pos..]) else {
+                    return false;
+                };
+                pos += v_len;
+            }
+            1 => {
+                if pos + 8 > buf.len() {
+                    return false;
+                }
+                pos += 8;
+            }
+            2 => {
+                let Ok((len, l_len)) = decode_varint(&buf[pos..]) else {
+                    return false;
+                };
+                pos += l_len;
+                let len_usize = len as usize;
+                let Some(end) = pos.checked_add(len_usize) else {
+                    return false;
+                };
+                if end > buf.len() {
+                    return false;
+                }
+                let child = &buf[pos..end];
+                if child.windows(needle.len()).any(|w| w == needle) {
+                    saw_child_with_needle = true;
+                }
+                pos = end;
+            }
+            5 => {
+                if pos + 4 > buf.len() {
+                    return false;
+                }
+                pos += 4;
+            }
+            _ => return false,
+        }
+        field_count += 1;
+    }
+    field_count > 0 && pos == buf.len() && saw_child_with_needle
+}
+
+/// Extracts all leaf UTF-8 `file:///` URI strings stored inside a Protobuf wire buffer.
+pub fn extract_protobuf_file_uris(buf: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    fn walk(b: &[u8], out: &mut Vec<String>) {
+        let mut pos = 0;
+        while pos < b.len() {
+            let Ok((tag, tag_len)) = decode_varint(&b[pos..]) else {
+                return;
+            };
+            let field_num = tag >> 3;
+            let wire_type = tag & 0x07;
+            if field_num == 0 || field_num > 512 {
+                return;
+            }
+            pos += tag_len;
+            match wire_type {
+                0 => {
+                    let Ok((_, v_len)) = decode_varint(&b[pos..]) else {
+                        return;
+                    };
+                    pos += v_len;
+                }
+                1 => {
+                    if pos + 8 > b.len() {
+                        return;
+                    }
+                    pos += 8;
+                }
+                2 => {
+                    let Ok((len, l_len)) = decode_varint(&b[pos..]) else {
+                        return;
+                    };
+                    pos += l_len;
+                    let len_usize = len as usize;
+                    let Some(end) = pos.checked_add(len_usize) else {
+                        return;
+                    };
+                    if end > b.len() {
+                        return;
+                    }
+                    let sub = &b[pos..end];
+                    pos = end;
+                    if !sub.windows(8).any(|w| w == b"file:///") {
+                        continue;
+                    }
+                    if is_protobuf_submessage_with_needle(sub, b"file:///") {
+                        walk(sub, out);
+                    } else if let Ok(s) = std::str::from_utf8(sub) {
+                        if s.starts_with("file:///") {
+                            out.push(s.to_string());
+                        }
+                    }
+                }
+                5 => {
+                    if pos + 4 > b.len() {
+                        return;
+                    }
+                    pos += 4;
+                }
+                _ => return,
+            }
+        }
+    }
+    walk(buf, &mut out);
+    out
+}
+
 /// Recursively walks a Protobuf wire buffer and replaces occurrences of `from_bytes` with `to_bytes`
 /// inside UTF-8 string payloads, automatically recalculating all parent length-delimited varints!
 ///
@@ -146,6 +280,9 @@ pub fn rewrite_protobuf_strings(buf: &[u8], from_str: &str, to_str: &str) -> Res
                     .any(|w| w == from_str.as_bytes())
                 {
                     payload.to_vec()
+                } else if is_protobuf_submessage_with_needle(payload, from_str.as_bytes()) {
+                    rewrite_protobuf_strings(payload, from_str, to_str)
+                        .unwrap_or_else(|_| payload.to_vec())
                 } else if let Ok(utf8_str) = std::str::from_utf8(payload) {
                     // Check if it's a plain UTF-8 string (no control chars besides \n, \r, \t)
                     let is_plain_text = utf8_str
@@ -396,8 +533,7 @@ impl ProtobufSummariesMap {
         if !path.exists() {
             return Ok(Self::new());
         }
-        let bytes =
-            fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+        let bytes = fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
         Self::from_bytes(&bytes)
     }
 
@@ -445,10 +581,7 @@ impl ProtobufSummariesMap {
                         pos = end;
                     }
                     5 => pos += 4,
-                    other => bail!(
-                        "Unsupported wire type {} in *_summaries_proto.pb",
-                        other
-                    ),
+                    other => bail!("Unsupported wire type {} in *_summaries_proto.pb", other),
                 }
             }
         }
@@ -463,8 +596,7 @@ impl ProtobufSummariesMap {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         for (key, val_bytes) in &self.entries {
-            let mut entry_buf =
-                Vec::with_capacity(2 + key.len() + 5 + val_bytes.len());
+            let mut entry_buf = Vec::with_capacity(2 + key.len() + 5 + val_bytes.len());
             // Field 1: key (string)
             encode_varint(0x0a, &mut entry_buf);
             encode_varint(key.len() as u64, &mut entry_buf);
@@ -531,7 +663,7 @@ impl ProtobufSummariesMap {
 }
 
 /// Extracts workspace URIs (`file://...`) and optional title from a `TrajectorySummary` protobuf payload.
-pub fn extract_summary_metadata_from_pb(raw_summary: &[u8]) -> ( Option<String>, Vec<String> ) {
+pub fn extract_summary_metadata_from_pb(raw_summary: &[u8]) -> (Option<String>, Vec<String>) {
     let strings = extract_printable_strings(raw_summary, 4);
     let mut uris = Vec::new();
     let mut title: Option<String> = None;
@@ -625,8 +757,7 @@ mod tests {
 
     #[test]
     fn test_nested_protobuf_rewrite_across_varint_boundary() {
-        let mac_uri = "file:///Users/devuser/Documents/projects/sample-sync-engine/"
-            .to_string()
+        let mac_uri = "file:///Users/devuser/Documents/projects/sample-sync-engine/".to_string()
             + &"a".repeat(80);
         let linux_uri = mac_uri.replace("/Users/devuser", "/home/remote/devuser");
 
@@ -713,9 +844,7 @@ mod tests {
         assert!(updated
             .windows(target_uuid.len())
             .any(|w| w == target_uuid.as_bytes()));
-        assert!(!updated
-            .windows(cli_proj.len())
-            .any(|w| w == cli_proj));
+        assert!(!updated.windows(cli_proj.len()).any(|w| w == cli_proj));
         assert!(updated.windows(uri.len()).any(|w| w == uri));
 
         // Also test inserting project_id into a message without field 17
@@ -728,5 +857,37 @@ mod tests {
         assert!(inserted
             .windows(target_uuid.len())
             .any(|w| w == target_uuid.as_bytes()));
+    }
+
+    #[test]
+    fn test_rewrite_single_field_submessage_with_newline_tag() {
+        // Submessage where field 1 tag is 0x0A ('\n') and string length is 0x4E ('N' = 78):
+        // every byte in `sub` is valid UTF-8 without control chars other than '\n'!
+        let old_uri =
+            "file:///Users/alice/Downloads/legacy-workspace-root/sample-analytics-dashboard";
+        assert_eq!(old_uri.len(), 78);
+        let new_uri = "file:///Users/alice/Documents/projects/sample-analytics-dashboard";
+        assert_eq!(new_uri.len(), 65);
+
+        let mut sub = Vec::new();
+        encode_varint(0x0a, &mut sub);
+        encode_varint(old_uri.len() as u64, &mut sub);
+        sub.extend_from_slice(old_uri.as_bytes());
+
+        let mut outer = Vec::new();
+        encode_varint((9 << 3) | 2, &mut outer);
+        encode_varint(sub.len() as u64, &mut outer);
+        outer.extend_from_slice(&sub);
+
+        let rewritten = rewrite_protobuf_strings(
+            &outer,
+            "/Users/alice/Downloads/legacy-workspace-root/sample-analytics-dashboard",
+            "/Users/alice/Documents/projects/sample-analytics-dashboard",
+        )
+        .unwrap();
+
+        assert!(is_likely_protobuf_message(&rewritten));
+        let uris = extract_protobuf_file_uris(&rewritten);
+        assert_eq!(uris, vec![new_uri.to_string()]);
     }
 }

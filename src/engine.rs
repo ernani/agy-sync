@@ -5,12 +5,13 @@ use crate::discovery::{
 };
 use crate::harnesses::{
     discover_single_harness, ensure_agy20_state_and_trust, merge_legacy_gemini_cli_metadata,
-    sync_config_project_files, HarnessKind,
+    sync_cli_history_and_trust, sync_config_project_files, HarnessKind,
 };
 use crate::index_merge::{
-     apply_home_remap_str, export_project_manifest, find_sessions_with_home_prefix,
-    home_search_needles, merge_project_manifest, normalize_harness_app_data_dir,
-    purge_sessions_from_harness, remap_conversation_artifacts, MergeStats,
+    apply_home_remap_str, export_project_manifest, find_sessions_with_home_prefix,
+    heal_intra_host_workspace_drift, home_search_needles, merge_project_manifest,
+    normalize_harness_app_data_dir, purge_sessions_from_harness, remap_conversation_artifacts,
+    MergeStats,
 };
 use crate::transport::{
     ensure_sufficient_fd_limit, probe_remote, push_staged_remote_harness_index,
@@ -236,7 +237,10 @@ pub fn self_heal_workspace_terraform_artifacts(
                 continue;
             };
             if p.is_dir() {
-                if matches!(name, ".git" | "target" | "node_modules" | ".venv" | "__pycache__") {
+                if matches!(
+                    name,
+                    ".git" | "target" | "node_modules" | ".venv" | "__pycache__"
+                ) {
                     continue;
                 }
                 if !include_build_dirs && name == ".terragrunt-cache" {
@@ -398,7 +402,9 @@ pub fn print_report(report: &SyncReport, config: &EngineConfig) {
     }
 
     for hr in &report.harness_reports {
-        println!("--------------------------------------------------------------------------------");
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
         println!(
             " Harness: {} [{}]",
             hr.kind.short_name(),
@@ -497,12 +503,16 @@ pub fn print_report(report: &SyncReport, config: &EngineConfig) {
     }
 
     if config.mode != SyncMode::Inspect {
-        println!("================================================================================");
+        println!(
+            "================================================================================"
+        );
         println!(
             " BIDIRECTIONAL SYNC SUMMARY{}",
             if config.dry_run { " (DRY-RUN)" } else { "" }
         );
-        println!("--------------------------------------------------------------------------------");
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
 
         // 1. Outbound (Local -> Remote)
         let total_pushed: usize = report
@@ -537,7 +547,9 @@ pub fn print_report(report: &SyncReport, config: &EngineConfig) {
             }
         }
 
-        println!("--------------------------------------------------------------------------------");
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
         // 2. Inbound (Remote -> Local)
         let total_pulled: usize = report
             .harness_reports
@@ -571,7 +583,9 @@ pub fn print_report(report: &SyncReport, config: &EngineConfig) {
             }
         }
 
-        println!("--------------------------------------------------------------------------------");
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
         println!(
             " Global Index Merge Totals -> Remote Upserted: {} (FTS: {}, Protobuf: {}) | Local Upserted: {} (FTS: {}, Protobuf: {})",
             report.remote_merge_stats.summaries_upserted,
@@ -921,7 +935,13 @@ fn run_session_harness(
             "Pulling {} session artifact path(s) from Remote -> Local ...",
             pull_rel_set.len()
         ));
-        remote_checkpoint_or_clean_harness_wals(probe, subdir, &pulled_cids, false, config.dry_run)?;
+        remote_checkpoint_or_clean_harness_wals(
+            probe,
+            subdir,
+            &pulled_cids,
+            false,
+            config.dry_run,
+        )?;
         let pull_paths: Vec<String> = pull_rel_set.into_iter().collect();
         let update_only = config.mode == SyncMode::Sync;
         rsync_harness_relative_paths(
@@ -974,8 +994,7 @@ fn run_session_harness(
             crate::index_merge::remap_manifest_project_ids(&mut remote_manifest, pid);
         }
         let force = config.mode == SyncMode::Pull;
-        local_merge_stats =
-            merge_project_manifest(&local_harness_dir, &remote_manifest, force)?;
+        local_merge_stats = merge_project_manifest(&local_harness_dir, &remote_manifest, force)?;
         if subdir == "antigravity" {
             let _ = ensure_agy20_state_and_trust(&local_harness_dir, norm_project, config.dry_run);
         }
@@ -1024,6 +1043,37 @@ fn run_session_harness(
             local_merge_stats.summaries_upserted += heal_stats.summaries_upserted;
             local_merge_stats.fts_chunks_updated += heal_stats.fts_chunks_updated;
             local_merge_stats.protobuf_entries_updated += heal_stats.protobuf_entries_updated;
+        }
+    }
+
+    // Also reconcile any intra-host workspace path drift (e.g. relocated local project folders)
+    // and keep CLI caches (`history.jsonl`, `settings.json`, `cache/last_conversations.json`) aligned.
+    if !config.dry_run && !is_home_or_root_path(norm_project, &config.local_home) {
+        if let Ok(drift_stats) = heal_intra_host_workspace_drift(
+            &local_harness_dir,
+            norm_project,
+            &config.local_home,
+            config.deep_remap,
+        ) {
+            local_merge_stats.summaries_upserted += drift_stats.summaries_upserted;
+            local_merge_stats.fts_chunks_updated += drift_stats.fts_chunks_updated;
+            local_merge_stats.protobuf_entries_updated += drift_stats.protobuf_entries_updated;
+        }
+        if subdir == "antigravity-cli"
+            || local_harness_dir.join("history.jsonl").exists()
+            || local_harness_dir.join("cli").is_dir()
+            || local_harness_dir.join("cache").is_dir()
+        {
+            if let Ok(refreshed) = discover_project_sessions(norm_project, &local_harness_dir) {
+                if !refreshed.sessions.is_empty() {
+                    let _ = sync_cli_history_and_trust(
+                        &local_harness_dir,
+                        norm_project,
+                        &refreshed.sessions,
+                        false,
+                    );
+                }
+            }
         }
     }
 
@@ -1731,7 +1781,9 @@ mod tests {
         // Native provider binary and all .tfstate files are preserved and $HOME-remapped
         assert!(native_prov.exists());
         let backend_tfstate = fs::read_to_string(tf_dir.join("terraform.tfstate"))?;
-        assert!(backend_tfstate.contains("/Users/localdev/project/infra/uat/.terragrunt-local-state/terraform.tfstate"));
+        assert!(backend_tfstate.contains(
+            "/Users/localdev/project/infra/uat/.terragrunt-local-state/terraform.tfstate"
+        ));
         let local_tfstate = fs::read_to_string(tg_state_dir.join("terraform.tfstate"))?;
         assert!(local_tfstate.contains("/Users/localdev/project/out"));
 
