@@ -979,6 +979,70 @@ pub fn sync_cli_history_and_trust(
     Ok(added)
 }
 
+/// Ensures an `agy-2.0` (`~/.gemini/antigravity`) harness directory has completed onboarding
+/// (`settings.json` with `"onboardingComplete": true` + `project_path` in `"trustedWorkspaces"`,
+/// and `antigravity_state.pbtxt`) without copying unrelated local workspace paths across hosts.
+pub fn ensure_agy20_state_and_trust(
+    harness_dir: &Path,
+    project_path: &Path,
+    dry_run: bool,
+) -> Result<()> {
+    if dry_run {
+        return Ok(());
+    }
+    fs::create_dir_all(harness_dir)?;
+
+    let ws_str = project_path.to_string_lossy().to_string();
+    let settings_path = harness_dir.join("settings.json");
+    let mut settings_obj = if settings_path.exists() {
+        fs::read_to_string(&settings_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .filter(|v| v.is_object())
+            .unwrap_or_else(|| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    if let Some(map) = settings_obj.as_object_mut() {
+        map.entry("onboardingComplete".to_string())
+            .or_insert(serde_json::Value::Bool(true));
+        let arr_val = map
+            .entry("trustedWorkspaces".to_string())
+            .or_insert_with(|| serde_json::json!([]));
+        if !arr_val.is_array() {
+            *arr_val = serde_json::json!([]);
+        }
+        if let Some(arr) = arr_val.as_array_mut() {
+            if !ws_str.is_empty() && !arr.iter().any(|x| x.as_str() == Some(ws_str.as_str())) {
+                arr.push(serde_json::Value::String(ws_str));
+            }
+        }
+    }
+
+    if let Ok(pretty) = serde_json::to_string_pretty(&settings_obj) {
+        let _ = fs::write(&settings_path, format!("{}\n", pretty));
+    }
+
+    let state_pbtxt_path = harness_dir.join("antigravity_state.pbtxt");
+    if !state_pbtxt_path.exists() {
+        let default_pbtxt = concat!(
+            "post_onboarding: {\n",
+            "  completed_steps: POST_ONBOARDING_STEP_TYPE_MANAGER_WELCOME\n",
+            "  completed_steps: POST_ONBOARDING_STEP_TYPE_USAGE_MODE\n",
+            "  completed_steps: POST_ONBOARDING_STEP_TYPE_AGENT_CONFIGURATION\n",
+            "  completed_steps: POST_ONBOARDING_STEP_TYPE_ADD_WORKSPACE\n",
+            "}\n",
+            "agent_onboarding_completed: AGENT_ONBOARDING_STATE_COMPLETED\n",
+            "migrate_convos_into_projects: MIGRATION_STATUS_COMPLETED\n",
+            "migrate_retroactive_projects: RETROACTIVE_MIGRATION_STATUS_COMPLETED_UNNECESSARY\n",
+        );
+        let _ = fs::write(&state_pbtxt_path, default_pbtxt);
+    }
+
+    Ok(())
+}
+
 fn copy_session_artifact_rel(src_root: &Path, dst_root: &Path, rel: &str) -> Result<()> {
     let src_full = src_root.join(rel);
     let dst_full = dst_root.join(rel);
@@ -1080,6 +1144,7 @@ pub fn migrate_project_between_local_harnesses(
                         || (s.step_count == d.step_count
                             && s.last_modified_time >= d.last_modified_time)
                         || d.relative_paths.is_empty()
+                        || (d.title.trim().is_empty() && !s.title.trim().is_empty())
                 }
                 _ => false,
             };
@@ -1133,6 +1198,9 @@ pub fn migrate_project_between_local_harnesses(
                 false,
             );
         }
+        if dst_sub == "antigravity" {
+            let _ = ensure_agy20_state_and_trust(dst_harness_dir, &norm_dst_proj, false);
+        }
     }
 
     // 2. Copy/merge from dst -> src if CoexistInBoth or OnlyInSource
@@ -1148,6 +1216,7 @@ pub fn migrate_project_between_local_harnesses(
                         || (d.step_count == s.step_count
                             && d.last_modified_time > s.last_modified_time)
                         || s.relative_paths.is_empty()
+                        || (s.title.trim().is_empty() && !d.title.trim().is_empty())
                 }
                 _ => false,
             };
@@ -1222,6 +1291,9 @@ pub fn migrate_project_between_local_harnesses(
                 &refreshed_src.sessions,
                 false,
             );
+        }
+        if src_sub == "antigravity" {
+            let _ = ensure_agy20_state_and_trust(src_harness_dir, &norm_dst_proj, false);
         }
     }
 

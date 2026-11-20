@@ -1,3 +1,4 @@
+use agy_sync::catalog::{run_catalog_command, CatalogCategory};
 use agy_sync::config::{
     config_file_path, detect_port_in_ssh_config, resolve_local_home, AgySyncConfig, SyncStateLedger,
 };
@@ -107,6 +108,22 @@ enum Commands {
         #[arg(long)]
         to: Option<String>,
     },
+    /// Compare and reconcile global skills, plugins, extensions, and custom agents across hosts (`~/.agents/skills` & `~/.gemini`)
+    #[command(visible_aliases = ["catalog", "extensions", "plugins"])]
+    Skills {
+        /// Categories to inspect (`skills`, `plugins`, `extensions`, `agents`, or `all`)
+        #[arg(short = 'k', long = "kind", value_delimiter = ',')]
+        kinds: Vec<String>,
+        /// Also list byte-for-byte identical items in the comparison table
+        #[arg(long)]
+        show_identical: bool,
+        /// Force external-host quarantine rules even when both hosts share custom session directories
+        #[arg(long)]
+        external: bool,
+        /// Automatically apply all non-quarantined Keep-Local / Keep-Remote suggestions without prompting
+        #[arg(long)]
+        apply_suggestions: bool,
+    },
     /// View or update persistent defaults stored in `$HOME/.config/.agy-sync`
     Config {
         /// Display current configuration in `$HOME/.config/.agy-sync`
@@ -198,14 +215,14 @@ fn resolve_harnesses(
         .map(|d| d.kind)
         .collect();
     if active.is_empty() {
-        let session_harnesses: Vec<HarnessKind> = available
+        let builtin_sessions: Vec<HarnessKind> = HarnessKind::builtin()
             .into_iter()
             .filter(|k| k.session_subdir().is_some())
             .collect();
-        if session_harnesses.is_empty() {
+        if builtin_sessions.is_empty() {
             Ok(vec![HarnessKind::Agy20])
         } else {
-            Ok(session_harnesses)
+            Ok(builtin_sessions)
         }
     } else {
         Ok(active)
@@ -353,6 +370,27 @@ fn main() -> Result<()> {
         .gemini_dir
         .unwrap_or_else(|| PathBuf::from(&local_home).join(".gemini"));
 
+    if let Some(Commands::Skills {
+        kinds,
+        show_identical,
+        external,
+        apply_suggestions,
+    }) = cli.command
+    {
+        let categories = CatalogCategory::parse_filter_list(&kinds)?;
+        let endpoint = resolve_remote_endpoint(cli.remote, cli.port, cli.user, &local_home)?;
+        return run_catalog_command(
+            Path::new(&local_home),
+            &local_gemini_dir,
+            &endpoint,
+            &categories,
+            cli.dry_run,
+            show_identical,
+            external,
+            apply_suggestions,
+        );
+    }
+
     let project_path = match cli.project {
         Some(p) => p,
         None => env::current_dir().context("Failed to determine current working directory")?,
@@ -364,7 +402,7 @@ fn main() -> Result<()> {
         Commands::Push => SyncMode::Push,
         Commands::Pull => SyncMode::Pull,
         Commands::Migrate { .. } => SyncMode::Sync,
-        Commands::Config { .. } => unreachable!(),
+        Commands::Skills { .. } | Commands::Config { .. } => unreachable!(),
     };
 
     let mut base_config = EngineConfig {
@@ -409,7 +447,9 @@ fn main() -> Result<()> {
             cli.user,
             &local_home,
         )?),
-        Commands::Migrate { .. } | Commands::Config { .. } => unreachable!(),
+        Commands::Migrate { .. } | Commands::Skills { .. } | Commands::Config { .. } => {
+            unreachable!()
+        }
     };
     base_config.endpoint = endpoint;
 

@@ -486,4 +486,275 @@ fn test_multi_harness_sync_agy20_plugins_and_legacy_cli() {
     let m_pr = fs::read_to_string(mac_gemini.join("history/vscode-app-slug/.project_root")).unwrap();
     assert!(m_pr.contains(&mac_home));
     assert!(!m_pr.contains(&remote_home));
+    assert!(remote_agy20.join("settings.json").exists());
+    assert!(remote_agy20.join("antigravity_state.pbtxt").exists());
+}
+
+#[test]
+fn test_custom_harness_quarantine_title_preservation_and_agy20_proto_guard() {
+    use agy_sync::harnesses::{migrate_project_between_local_harnesses, PlacementMode};
+    use agy_sync::index_merge::{ensure_summary_db_schema, export_project_manifest, merge_project_manifest};
+    use agy_sync::protobuf::ProtobufSummariesMap;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let local_home_raw = tmp.path().join("Users/alice");
+    let remote_home_raw = tmp.path().join("home/alice_vm");
+    fs::create_dir_all(&local_home_raw).unwrap();
+    fs::create_dir_all(&remote_home_raw).unwrap();
+    let local_home = normalize_project_path(&local_home_raw);
+    let remote_home = normalize_project_path(&remote_home_raw);
+
+    let local_proj = local_home.join("Projects/clean-app");
+    let remote_proj = remote_home.join("Projects/clean-app");
+    fs::create_dir_all(&local_proj).unwrap();
+    fs::create_dir_all(&remote_proj).unwrap();
+
+    let local_gemini = local_home.join(".gemini");
+    let remote_gemini = remote_home.join(".gemini");
+    fs::create_dir_all(remote_gemini.join("antigravity")).unwrap();
+
+    // Local has a custom session directory `workstation_box` that does NOT exist on Remote
+    let local_custom = local_gemini.join("workstation_box");
+    fs::create_dir_all(local_custom.join("conversations")).unwrap();
+    let cid = "11111111-2222-4333-8444-555555555555";
+    let local_uri = path_to_file_uri(&local_proj);
+    create_conversation_db(
+        &local_custom.join(format!("conversations/{}.db", cid)),
+        &local_uri,
+    );
+    {
+        let conn = Connection::open(local_custom.join("conversation_summaries.db")).unwrap();
+        ensure_summary_db_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO conversation_summaries (conversation_id, title, preview, step_count, last_modified_time, workspace_uris, app_data_dir)
+             VALUES (?1, 'Titled Architecture Session', 'Preview text', 10, '2026-11-10T01:00:00Z', ?2, 'workstation_box')",
+            params![cid, format!("[\"{}\"]", local_uri)],
+        )
+        .unwrap();
+        let mut pb = ProtobufSummariesMap::default();
+        pb.upsert(cid.to_string(), create_proto_blob_with_uri(&local_uri));
+        pb.save_to_path(&local_custom.join("workstation_summaries_proto.pb"))
+            .unwrap();
+    }
+
+    // 1. Migrate from `workstation_box` into fresh `antigravity` on Local:
+    //    must write `agyhub_summaries_proto.pb` (NOT `workstation_summaries_proto.pb`) + `settings.json` + `antigravity_state.pbtxt`
+    let local_agy20 = local_gemini.join("antigravity");
+    migrate_project_between_local_harnesses(
+        &local_gemini,
+        &local_custom,
+        &local_agy20,
+        &local_proj,
+        &local_proj,
+        PlacementMode::CoexistInBoth,
+        false,
+        false,
+    )
+    .unwrap();
+
+    assert!(local_agy20.join("agyhub_summaries_proto.pb").exists());
+    assert!(!local_agy20.join("workstation_summaries_proto.pb").exists());
+    assert!(local_agy20.join("settings.json").exists());
+    assert!(local_agy20.join("antigravity_state.pbtxt").exists());
+
+    // 2. Verify empty incoming title never clobbers existing non-empty title
+    {
+        let mut cids = std::collections::BTreeSet::new();
+        cids.insert(cid.to_string());
+        let mut manifest = export_project_manifest(&local_agy20, &cids, None).unwrap();
+        manifest.summaries[0].title = String::new();
+        manifest.summaries[0].step_count = 12;
+        merge_project_manifest(&local_agy20, &manifest, false).unwrap();
+
+        let conn = Connection::open(local_agy20.join("conversation_summaries.db")).unwrap();
+        let preserved_title: String = conn
+            .query_row(
+                "SELECT title FROM conversation_summaries WHERE conversation_id = ?1",
+                params![cid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_title, "Titled Architecture Session");
+    }
+
+    // 3. Syncing to external Remote where `workstation_box` does not exist MUST quarantine/skip `workstation_box`
+    let cfg = EngineConfig {
+        mode: SyncMode::Sync,
+        project_path: local_proj,
+        local_home: local_home.to_string_lossy().to_string(),
+        local_gemini_dir: local_gemini,
+        selected_harnesses: vec![
+            HarnessKind::CustomSessionDir("workstation_box".to_string()),
+            HarnessKind::Agy20,
+        ],
+        endpoint: Some(RemoteEndpoint::LocalRoot {
+            root_home: remote_home.clone(),
+        }),
+        no_remap: false,
+        deep_remap: false,
+        dry_run: false,
+        delete: false,
+        include_build_dirs: false,
+        extra_excludes: vec![],
+    };
+
+    run_engine(&cfg).unwrap();
+    assert!(
+        !remote_gemini.join("workstation_box").exists(),
+        "Custom harness absent on remote must never be created on external remote"
+    );
+    assert!(remote_gemini.join("antigravity/agyhub_summaries_proto.pb").exists());
+    let r_settings = fs::read_to_string(remote_gemini.join("antigravity/settings.json")).unwrap();
+    assert!(r_settings.contains(&remote_proj.to_string_lossy().to_string()));
+}
+
+#[test]
+fn test_global_catalog_skills_plugins_version_diff_quarantine_and_actions() {
+    use agy_sync::catalog::{
+        build_catalog_plan, execute_catalog_action, scan_catalog_at_home, CatalogAction,
+        CatalogCategory, CatalogDiffStatus,
+    };
+    use agy_sync::transport::probe_remote;
+    use std::collections::BTreeSet;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let local_home = tmp.path().join("Users/dev");
+    let remote_home = tmp.path().join("home/dev");
+    fs::create_dir_all(local_home.join(".gemini/antigravity")).unwrap();
+    fs::create_dir_all(local_home.join(".gemini/workstation_only")).unwrap();
+    fs::create_dir_all(remote_home.join(".gemini/antigravity")).unwrap();
+
+    // 1. Identical skill (with different $HOME strings inside)
+    let l_id = local_home.join(".agents/skills/open-graph");
+    let r_id = remote_home.join(".agents/skills/open-graph");
+    fs::create_dir_all(&l_id).unwrap();
+    fs::create_dir_all(&r_id).unwrap();
+    fs::write(
+        l_id.join("SKILL.md"),
+        format!("---\nname: open-graph\n---\nPath: {}/tools\n", local_home.display()),
+    )
+    .unwrap();
+    fs::write(
+        r_id.join("SKILL.md"),
+        format!("---\nname: open-graph\n---\nPath: {}/tools\n", remote_home.display()),
+    )
+    .unwrap();
+
+    // 2. Semver LocalNewer skill (`1.13.0` on Local vs `1.4.0` on Remote)
+    let l_adk = local_home.join(".agents/skills/adk-deploy");
+    let r_adk = remote_home.join(".agents/skills/adk-deploy");
+    fs::create_dir_all(&l_adk).unwrap();
+    fs::create_dir_all(&r_adk).unwrap();
+    fs::write(l_adk.join("SKILL.md"), "---\nversion: 1.13.0\n---\nNewer ADK\n").unwrap();
+    fs::write(r_adk.join("SKILL.md"), "---\nversion: 1.4.0\n---\nOlder ADK\n").unwrap();
+
+    // 3. Semver RemoteNewer plugin (`2.1.0` on Remote vs `2.0.0` on Local)
+    let l_plug = local_home.join(".gemini/config/plugins/web-helper");
+    let r_plug = remote_home.join(".gemini/config/plugins/web-helper");
+    fs::create_dir_all(&l_plug).unwrap();
+    fs::create_dir_all(&r_plug).unwrap();
+    fs::write(l_plug.join("plugin.json"), "{\"version\": \"2.0.0\"}\n").unwrap();
+    fs::write(r_plug.join("plugin.json"), "{\"version\": \"2.1.0\"}\n").unwrap();
+
+    // 4. Quarantined internal skill referencing `/.gemini/workstation_only/` (absent on Remote)
+    let l_priv = local_home.join(".agents/skills/internal-radar");
+    fs::create_dir_all(&l_priv).unwrap();
+    fs::write(
+        l_priv.join("SKILL.md"),
+        "Reads ~/.gemini/workstation_only/conversation_summaries.db directly\n".replace(
+            "~/.gemini/",
+            &format!("{}/.gemini/", local_home.display()),
+        ),
+    )
+    .unwrap();
+
+    // 5. Superseded prefixed skill (`legacy-autoloop` on Remote vs newer `autoloop` on Local)
+    let r_old = remote_home.join(".agents/skills/legacy-autoloop");
+    let l_new = local_home.join(".agents/skills/autoloop");
+    fs::create_dir_all(&r_old).unwrap();
+    fs::write(r_old.join("SKILL.md"), "Old prefixed\n").unwrap();
+    fs::create_dir_all(&l_new).unwrap();
+    fs::write(l_new.join("SKILL.md"), "New unprefixed\n").unwrap();
+
+    let cats = CatalogCategory::parse_filter_list(&[]).unwrap();
+    let l_items = scan_catalog_at_home(&local_home, &cats).unwrap();
+    let r_items = scan_catalog_at_home(&remote_home, &cats).unwrap();
+
+    let mut l_subs = BTreeSet::new();
+    l_subs.insert("antigravity".to_string());
+    l_subs.insert("workstation_only".to_string());
+    let mut r_subs = BTreeSet::new();
+    r_subs.insert("antigravity".to_string());
+
+    let plan = build_catalog_plan(&l_items, &r_items, &l_subs, &r_subs, &BTreeSet::new(), false);
+
+    let find_entry = |name: &str| plan.iter().find(|e| e.name == name).unwrap();
+    assert_eq!(find_entry("open-graph").status, CatalogDiffStatus::Identical);
+    assert_eq!(find_entry("adk-deploy").status, CatalogDiffStatus::LocalNewer);
+    assert_eq!(
+        find_entry("adk-deploy").suggested_action,
+        CatalogAction::KeepLocalPush
+    );
+    assert_eq!(find_entry("web-helper").status, CatalogDiffStatus::RemoteNewer);
+    assert_eq!(
+        find_entry("web-helper").suggested_action,
+        CatalogAction::KeepRemotePull
+    );
+    assert!(find_entry("internal-radar").quarantined);
+    assert_eq!(
+        find_entry("internal-radar").suggested_action,
+        CatalogAction::KeepAsIs
+    );
+    assert_eq!(
+        find_entry("legacy-autoloop").superseded_by.as_deref(),
+        Some("autoloop")
+    );
+    assert_eq!(
+        find_entry("legacy-autoloop").suggested_action,
+        CatalogAction::RemoveRemoteOnly
+    );
+
+    // Execute KeepLocalPush, KeepRemotePull, and RemoveRemoteOnly
+    let ep = RemoteEndpoint::LocalRoot {
+        root_home: remote_home.clone(),
+    };
+    let probe = probe_remote(&ep, &local_home.to_string_lossy(), &local_home).unwrap();
+
+    execute_catalog_action(
+        find_entry("adk-deploy"),
+        CatalogAction::KeepLocalPush,
+        &local_home,
+        &probe,
+        false,
+    )
+    .unwrap();
+    assert!(
+        fs::read_to_string(r_adk.join("SKILL.md"))
+            .unwrap()
+            .contains("1.13.0")
+    );
+
+    execute_catalog_action(
+        find_entry("web-helper"),
+        CatalogAction::KeepRemotePull,
+        &local_home,
+        &probe,
+        false,
+    )
+    .unwrap();
+    assert!(
+        fs::read_to_string(l_plug.join("plugin.json"))
+            .unwrap()
+            .contains("2.1.0")
+    );
+
+    execute_catalog_action(
+        find_entry("legacy-autoloop"),
+        CatalogAction::RemoveRemoteOnly,
+        &local_home,
+        &probe,
+        false,
+    )
+    .unwrap();
+    assert!(!r_old.exists());
 }

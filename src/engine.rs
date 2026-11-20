@@ -4,8 +4,8 @@ use crate::discovery::{
     normalize_project_path, path_to_file_uri, ProjectDiscovery,
 };
 use crate::harnesses::{
-    discover_single_harness, merge_legacy_gemini_cli_metadata, sync_config_project_files,
-    HarnessKind,
+    discover_single_harness, ensure_agy20_state_and_trust, merge_legacy_gemini_cli_metadata,
+    sync_config_project_files, HarnessKind,
 };
 use crate::index_merge::{
      apply_home_remap_str, export_project_manifest, find_sessions_with_home_prefix,
@@ -622,6 +622,33 @@ fn run_session_harness(
         });
     };
 
+    if matches!(kind, HarnessKind::CustomSessionDir(_))
+        && !probe.remote_existing_subdirs.contains(subdir)
+    {
+        if config.mode != SyncMode::Inspect {
+            log_substep(&format!(
+                "Skipping custom harness '{}' ({}) — directory is not present on remote host '{}'.",
+                kind.cli_id(),
+                kind.display_path(),
+                probe.endpoint.display_label()
+            ));
+        }
+        return Ok(HarnessSyncReport {
+            kind: kind.clone(),
+            local_harness_dir,
+            remote_harness_dir: String::new(),
+            local_discovery: Some(local_discovery),
+            remote_discovery: None,
+            session_actions: BTreeMap::new(),
+            pushed_sessions: Vec::new(),
+            pulled_sessions: Vec::new(),
+            local_merge_stats: MergeStats::default(),
+            remote_merge_stats: MergeStats::default(),
+            metadata_items_pushed: 0,
+            metadata_items_pulled: 0,
+        });
+    }
+
     let remote_harness_dir = probe.remote_harness_dir(subdir);
     let staging_remote_harness = staging_gemini_root.join(subdir);
     if config.mode != SyncMode::Inspect {
@@ -943,6 +970,9 @@ fn run_session_harness(
         let force = config.mode == SyncMode::Pull;
         local_merge_stats =
             merge_project_manifest(&local_harness_dir, &remote_manifest, force)?;
+        if subdir == "antigravity" {
+            let _ = ensure_agy20_state_and_trust(&local_harness_dir, norm_project, config.dry_run);
+        }
 
         // Also ensure any config/projects/<id>.json referenced by pulled sessions is synced locally
         if !remote_discovery.matched_project_ids.is_empty() {
@@ -1118,6 +1148,13 @@ fn run_session_harness(
         let force = config.mode == SyncMode::Push;
         remote_merge_stats =
             merge_project_manifest(&staging_remote_harness, &local_manifest, force)?;
+        if subdir == "antigravity" {
+            let _ = ensure_agy20_state_and_trust(
+                &staging_remote_harness,
+                Path::new(&probe.remote_project_path),
+                config.dry_run,
+            );
+        }
         push_staged_remote_harness_index(probe, subdir, &staging_remote_harness, config.dry_run)?;
 
         let mut all_project_ids = local_discovery.matched_project_ids.clone();
@@ -1151,6 +1188,26 @@ fn run_session_harness(
         }
 
         let _ = reload_remote_agent_services_if_present(&probe.endpoint);
+    } else if subdir == "antigravity"
+        && !all_cids.is_empty()
+        && !config.dry_run
+        && config.mode != SyncMode::Inspect
+        && (!staging_remote_harness
+            .join("antigravity_state.pbtxt")
+            .exists()
+            || !staging_remote_harness.join("settings.json").exists())
+    {
+        let _ = ensure_agy20_state_and_trust(
+            &staging_remote_harness,
+            Path::new(&probe.remote_project_path),
+            config.dry_run,
+        );
+        let _ = push_staged_remote_harness_index(
+            probe,
+            subdir,
+            &staging_remote_harness,
+            config.dry_run,
+        );
     }
 
     if !local_purge_cids.is_empty() {

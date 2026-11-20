@@ -152,4 +152,11 @@ agy-sync --harness agy-2.0,agy-cli sync
 # 7. Unidirectional push (Local -> Remote) or pull (Remote -> Local)
 agy-sync push
 agy-sync pull
+
+# 8. Cross-harness local project migration & coexistence wizard
+agy-sync migrate
+
+# 9. Compare & reconcile global skills, plugins, extensions, and custom agents across hosts
+agy-sync --dry-run skills --remote my-workstation.example.com
+agy-sync skills --remote my-workstation.example.com
 ```
